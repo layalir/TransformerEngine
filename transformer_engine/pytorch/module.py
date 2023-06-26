@@ -1750,7 +1750,7 @@ class _Linear(torch.autograd.Function):
                 dim_size = list(inputmat_total.size())
                 dim_size[0] = dim_size[0] // tp_world_size
                 dim_size[1] = weight.size(0)
-                rs_out = torch.empty(dim_size, dtype=activation_dtype, device=inputmat_total.device)
+                rs_out = torch.rand(dim_size, dtype=activation_dtype, device=inputmat_total.device)
             else:
                 dim_size = list(inputmat_total.size())
                 dim_size[1] = weight.size(0)
@@ -1794,7 +1794,7 @@ class _Linear(torch.autograd.Function):
                 dim_size = list(inputmat_total.size())
                 dim_size[0] = dim_size[0] // tp_world_size
                 dim_size[1] = weight.size(0)
-                rs_out = torch.empty(dim_size, dtype=activation_dtype, device=inputmat_total.device)
+                rs_out = torch.rand(dim_size, dtype=activation_dtype, device=inputmat_total.device)
             else:
                 dim_size = list(inputmat_total.size())
                 dim_size[1] = weight.size(0)
@@ -2531,7 +2531,7 @@ class _LayerNormMLP(torch.autograd.Function):
                 dim_size = list(gelu_out.size())
                 dim_size[0] = dim_size[0] // tp_world_size
                 dim_size[1] = fc2_weight.size(0)
-                rs_out = torch.empty(dim_size, dtype=activation_dtype, device=gelu_out.device)
+                rs_out = torch.rand(dim_size, dtype=activation_dtype, device=gelu_out.device)
             else:
                 dim_size = list(gelu_out.size())
                 dim_size[1] = fc2_weight.size(0)
@@ -2609,7 +2609,7 @@ class _LayerNormMLP(torch.autograd.Function):
                 dim_size = list(gelu_out.size())
                 dim_size[0] = dim_size[0] // tp_world_size
                 dim_size[1] = fc2_weight.size(0)
-                rs_out = torch.empty(dim_size, dtype=activation_dtype, device=gelu_out.device)
+                rs_out = torch.rand(dim_size, dtype=activation_dtype, device=gelu_out.device)
             else:
                 dim_size = list(gelu_out.size())
                 dim_size[1] = fc2_weight.size(0)

@@ -121,6 +121,7 @@ struct UbufCommOverlap : torch::CustomClassHolder {
     if (_comm_type == COMM_TYPE::AG) {
       allgather2_userbuff_inplace(_ub_reg, 0, comm_elements, _ub_comm, (cudaStream_t)_stream_comm);
     } else if (_comm_type == COMM_TYPE::RS) {
+      comm_elements = comm_elements/2;
       reducescatter2_userbuff_inplace(_ub_reg, 0, comm_elements, _ub_comm,
                                       (cudaStream_t)_stream_comm);
     } else {
@@ -223,8 +224,9 @@ struct UbufCommOverlap : torch::CustomClassHolder {
         CHECK_CUDA(cudaStreamWaitEvent((cudaStream_t)_stream_comm, _start_comm, 0));
 
         // Communication chunk
+        int m_ = m / 2;
         reducescatter2_userbuff_stridedoutput(rs_output_ptr, _ub_reg, (i - 1) * output_chunk_size,
-                                              m_chunk, n, m, _ub_comm, (cudaStream_t)_stream_comm);
+                                              m_chunk, n, m_, _ub_comm, (cudaStream_t)_stream_comm);
 
         rs_output_ptr += m_chunk * _ubuf.element_size();
       }
@@ -236,8 +238,9 @@ struct UbufCommOverlap : torch::CustomClassHolder {
 
       // Last communication chunk with max SM
       _ub_comm->sms = UB_MAX_SM;
+       int m_ = m / 2;
       reducescatter2_userbuff_stridedoutput(rs_output_ptr, _ub_reg,
-                                            (_num_splits - 1) * output_chunk_size, m_chunk, n, m,
+                                            (_num_splits - 1) * output_chunk_size, m_chunk, n, m_,
                                             _ub_comm, (cudaStream_t)_stream_comm);
     } else {
       for (int i = 0; i < _num_splits; i++) {
@@ -262,8 +265,9 @@ struct UbufCommOverlap : torch::CustomClassHolder {
         if (i == _num_splits-1) {
           _ub_comm->sms = UB_MAX_SM;
         }
+        int m_ = m / 2;
         reducescatter2_userbuff_stridedoutput(rs_output_ptr, _ub_reg, i * output_chunk_size,
-                                              m_chunk, n, m, _ub_comm, (cudaStream_t)_stream_comm);
+                                              m_chunk, n, m_, _ub_comm, (cudaStream_t)_stream_comm);
 
         rs_output_ptr += m_chunk * _ubuf.element_size();
         input_a_chunk_ptr += input_a_chunk_size * B.element_size();
