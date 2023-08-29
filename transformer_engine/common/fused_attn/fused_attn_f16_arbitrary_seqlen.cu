@@ -1325,7 +1325,7 @@ void fused_attn_arbitrary_seqlen_bwd_qkvpacked(size_t batch, size_t max_seqlen, 
     const auto qkv_type = input_QKV->data.dtype;
     size_t workspace_size = 0;
 
-    bool use_workspace_opt = false;
+    bool use_workspace_opt = true;
 #if (CUDNN_VERSION >= 8905)
     const int device_id = cuda::current_device();
     const int sm_arch_ = cuda::sm_arch(device_id);
@@ -1341,7 +1341,11 @@ void fused_attn_arbitrary_seqlen_bwd_qkvpacked(size_t batch, size_t max_seqlen, 
         size_t max_allowed = 1024 * 1024 * 1024;
 
         use_workspace_opt = (free_byte > wkspace_size) && (wkspace_size < max_allowed);
+        printf("free_byte=%d, wkspace_size=%d, total_byte=%d\n", free_byte, wkspace_size, total_byte);
     }
+
+    use_workspace_opt = getenv<bool>("USE_WORKSPACE_OPT");
+
 #endif
 
     fused_attn_arbitrary_seqlen_bwd_impl(batch, num_head, max_seqlen, max_seqlen, head_dim,
