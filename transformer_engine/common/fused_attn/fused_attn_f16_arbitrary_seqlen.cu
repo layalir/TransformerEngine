@@ -1344,7 +1344,7 @@ void fused_attn_arbitrary_seqlen_bwd_qkvpacked(size_t batch, size_t max_seqlen, 
         printf("free_byte=%d, wkspace_size=%d, total_byte=%d\n", free_byte, wkspace_size, total_byte);
     }
 
-    use_workspace_opt = getenv<bool>("USE_WORKSPACE_OPT");
+    use_workspace_opt = true;
 
 #endif
 
