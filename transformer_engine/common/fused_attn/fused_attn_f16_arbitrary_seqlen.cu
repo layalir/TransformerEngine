@@ -1341,12 +1341,14 @@ void fused_attn_arbitrary_seqlen_bwd_qkvpacked(size_t batch, size_t max_seqlen, 
         size_t max_allowed = 1024 * 1024 * 1024;
 
         use_workspace_opt = (free_byte > wkspace_size) && (wkspace_size < max_allowed);
-//        printf("free_byte=%d, wkspace_size=%d, total_byte=%d\n", free_byte, wkspace_size, total_byte);
+        if (std::getenv("DEBUG_FA"))
+            printf("free_byte=%d, wkspace_size=%d, total_byte=%d\n", free_byte, wkspace_size, total_byte);
    //     use_workspace_opt = true;
 
     }
       use_workspace_opt = std::getenv("USE_WORKSPACE_OPT");
-//    printf("use_workspace_opt =%d",use_workspace_opt)
+      if (std::getenv("DEBUG_FA"))
+          printf("use_workspace_opt =%d",use_workspace_opt)
 
 #endif
 
