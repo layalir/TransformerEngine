@@ -1345,6 +1345,7 @@ void fused_attn_arbitrary_seqlen_bwd_qkvpacked(size_t batch, size_t max_seqlen, 
    //     use_workspace_opt = true;
 
     }
+      use_workspace_opt = std::getenv("USE_WORKSPACE_OPT");
 //    printf("use_workspace_opt =%d",use_workspace_opt)
 
 #endif
