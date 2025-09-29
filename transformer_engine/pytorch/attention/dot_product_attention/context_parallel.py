@@ -1824,7 +1824,6 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         nvtx_label = "transformer_engine.AttnFuncWithCPAndKVP2P.backward"
         nvtx_range_push(f"{nvtx_label}")
 
-        # corner case:
         # dout is expected to be in FP8 if is_output_fp8=True,
         # but in the case it's not, convert it to FP8 before any operation
         if ctx.fp8 and ctx.is_output_fp8 and not isinstance(dout, QuantizedTensorBase):
@@ -3290,8 +3289,10 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
                 out_ = out_.view(-1, batch_size, *out_.shape[-2:])
 
         if fp8 and use_fused_attention:
-            if fp8_recipe.float8_current_scaling() and is_output_fp8:
-                out_fp8 = O_quantizer(out_)
+            if fp8_recipe.float8_current_scaling():
+                out_f16 = out_
+                if is_output_fp8:
+                    out_fp8 = O_quantizer(out_)
             if fp8_recipe.delayed():
                 out_fp8 = Float8Tensor.make_like(out_fp8, data=out_, dtype=fwd_nominal_dtype)
                 if not is_output_fp8:
@@ -3311,8 +3312,7 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
             else:
                 fp8_tensors = (q_part, k_part, v_part, out_part)
         elif fp8:
-            if is_input_fp8:
-                q_part, k_part, v_part = combine_and_dequantize(qkv_layout, q_part, k_part, v_part)
+            q_part, k_part, v_part = combine_and_dequantize(qkv_layout, q_part, k_part, v_part)
             f16_tensors = (q_part, k_part, v_part, out_part)
         else:
             f16_tensors = (q_part, k_part, v_part, out_part)
@@ -3421,7 +3421,9 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
 
         if not ctx.use_fused_attention:
             out = out.view(ctx.batch_size, -1, *out.shape[-2:])
-        dout = dout.view(*ctx.out_shape)
+            dout = dout.view(ctx.batch_size, -1, *dout.shape[-2:])
+        else:
+            dout = dout.view(*ctx.out_shape)
 
         chunk_ids_for_a2a = get_seq_chunk_ids_for_reordering_before_attn(cp_size, dout.device)
         dout = flash_attn_a2a_communicate(
@@ -3501,7 +3503,7 @@ class AttnFuncWithCPAndQKVOA2A(torch.autograd.Function):
                 **fp8_meta_kwargs,
                 softmax_type=ctx.softmax_type,
             )
-            if all(isinstance(x, Float8Tensor) for x in [dq, dk, dv]):
+            if isinstance(dq, Float8Tensor):
                 dq_fp8, dk_fp8, dv_fp8 = dq, dk, dv
                 dq, dk, dv = [x._data for x in [dq, dk, dv]]
         else:

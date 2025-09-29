@@ -359,8 +359,31 @@ def get_attention_backend(
         field.name: getattr(attention_params, field.name) for field in fields(attention_params)
     }
     run_config.update(attention_params_dict)
+    # Add FP8 environment variables to config
     if fp8:
+        # all FP8 recipes: 1: (FP8 fwd, FP8 bwd), 0: (FP8 fwd, F16 bwd)
         run_config["NVTE_FP8_DPA_BWD"] = int(os.getenv("NVTE_FP8_DPA_BWD", "1"))
+        # Float8CurrentScaling: 1: use F16 O in bwd, 0: use FP8 O in bwd
+        run_config["NVTE_DPA_FP8CS_O_in_F16"] = int(os.getenv("NVTE_DPA_FP8CS_O_in_F16", "0"))
+        # switch recipe to "F16", "DelayedScaling", or "Float8CurrentScaling"
+        _dpa_fp8_recipe = os.getenv("NVTE_DPA_FP8_RECIPE", "")
+        run_config["NVTE_DPA_FP8_RECIPE"] = _dpa_fp8_recipe
+        if _dpa_fp8_recipe != "":
+            # config new recipe if switched
+            run_config["NVTE_DPA_FP8_FORMAT"] = os.getenv("NVTE_DPA_FP8_FORMAT", "HYBRID")
+            run_config["NVTE_DPA_FP8DS_AMAX_ALGO"] = os.getenv(
+                "NVTE_DPA_FP8DS_AMAX_ALGO", "most_recent"
+            )
+            run_config["NVTE_DPA_FP8DS_AMAX_HISTLEN"] = int(
+                os.getenv("NVTE_DPA_FP8DS_AMAX_HISTLEN", "1")
+            )
+            run_config["NVTE_DPA_FP8DS_REDUCE_AMAX"] = int(
+                os.getenv("NVTE_DPA_FP8DS_REDUCE_AMAX", "1")
+            )
+        # UnfusedDotProductAttention: 1: allow FP8 emulation, 0: do not allow
+        run_config["NVTE_UnfusedDPA_Emulate_FP8"] = int(
+            os.getenv("NVTE_UnfusedDPA_Emulate_FP8", "0")
+        )
     logger.debug("Running with config=%s", run_config)
 
     # The following sections check if `FlashAttention` supports the provided attention params,
@@ -444,6 +467,13 @@ def get_attention_backend(
             if not allow_emulation:
                 logger.debug("Disabling UnfusedDotProductAttention for FP8 attention")
                 use_unfused_attention = False
+        if (
+            use_fused_attention
+            and fp8_meta["recipe"].float8_current_scaling()
+            and device_compute_capability < (10, 0)
+        ):
+            logger.debug("Disabling FusedAttention for FP8 current scaling on arch < sm100")
+            use_fused_attention = False
 
     # Filter: KV cache
     # backend  | precision      |    KV cache     | architecture | qkv_format    | page_size
@@ -1923,22 +1953,6 @@ def print_quantizers(
     dP_quantizer,
 ):
     """Print the type and scale/amax of attention quantizers"""
-    names = [
-        "QKV_quantizer",
-        "S_quantizer",
-        "O_quantizer",
-        "dO_quantizer",
-        "dP_quantizer",
-        "dQKV_quantizer",
-    ]
-    quantizers = [
-        QKV_quantizer,
-        S_quantizer,
-        O_quantizer,
-        dO_quantizer,
-        dP_quantizer,
-        dQKV_quantizer,
-    ]
     if (
         _to_print
         and _to_print_layer == layer_number
@@ -1947,6 +1961,28 @@ def print_quantizers(
             or (dist.is_initialized() and dist.get_rank() == _to_print_rank)
         )
     ):
+        names = [
+            "QKV_quantizer",
+            "S_quantizer",
+            "O_quantizer",
+            "dO_quantizer",
+            "dP_quantizer",
+            "dQKV_quantizer",
+        ]
+        quantizers = [
+            QKV_quantizer,
+            S_quantizer,
+            O_quantizer,
+            dO_quantizer,
+            dP_quantizer,
+            dQKV_quantizer,
+        ]
+        if "forward" in label:
+            names = names[:3]
+            quantizers = quantizers[:3]
+        if "backward" in label:
+            names = names[3:]
+            quantizers = quantizers[3:]
         for i, q in enumerate(quantizers):
             type_str = ""
             if q is None:
@@ -1966,7 +2002,6 @@ def combine_and_quantize(qkv_layout, q, k, v, qkv_quantizer):
     # 1: qkv packed, 2: kv packed, 3: qkv separate
     qkv_layout = qkv_layout.replace("paged_kv_", "")
     qkv_group = len(qkv_layout.split("_"))
-    src_nominal_dtype = q.dtype
     match qkv_group:
         case 1:
             dim = qkv_layout.find("3")
@@ -1978,17 +2013,19 @@ def combine_and_quantize(qkv_layout, q, k, v, qkv_quantizer):
             kv = combine_tensors([k, v], dim)
             tensors = [q, kv]
             if isinstance(qkv_quantizer, Float8CurrentScalingQuantizer):
-                amax = max([x.abs().max() for x in tensors])
+                amax_q, amax_kv = [x.abs().max() for x in tensors]
+                qkv_quantizer.amax = torch.maximum(amax_q, amax_kv).to(dtype=torch.float32)
                 qkv_quantizer.use_existing_amax = True
-                qkv_quantizer.amax = amax.to(dtype=torch.float32)
             q_fp8, kv_fp8 = [qkv_quantizer(x) for x in tensors]
             k_fp8, v_fp8 = SplitAlongDim.apply(kv_fp8, dim, [1, 1], True)
         case 3:
             tensors = [q, k, v]
             if isinstance(qkv_quantizer, Float8CurrentScalingQuantizer):
-                amax = max([x.abs().max() for x in tensors])
+                amax_q, amax_k, amax_v = [x.abs().max() for x in tensors]
+                qkv_quantizer.amax = torch.maximum(torch.maximum(amax_q, amax_k), amax_v).to(
+                    dtype=torch.float32
+                )
                 qkv_quantizer.use_existing_amax = True
-                qkv_quantizer.amax = amax.to(dtype=torch.float32)
             q_fp8, k_fp8, v_fp8 = [qkv_quantizer(x) for x in tensors]
         case _:
             raise RuntimeError("Invalid qkv_layout " + qkv_layout)
