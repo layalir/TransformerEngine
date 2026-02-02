@@ -44,23 +44,31 @@ class ScaledUpperTriangMaskedSoftmax(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, inputs: torch.Tensor, scale: float) -> torch.Tensor:
+    def forward(ctx, inputs: torch.Tensor, scale: float, layer_number: int = 0) -> torch.Tensor:
         """ScaledUpperTriangMaskedSoftmax fwd"""
         scale_t = torch.tensor([scale])
         softmax_results = tex.scaled_upper_triang_masked_softmax_forward(inputs, scale_t[0])
 
         ctx.save_for_backward(softmax_results, scale_t)
+        ctx.layer_number = layer_number
         return softmax_results
 
     @staticmethod
     def backward(ctx, output_grads: torch.Tensor) -> Tuple[Union[torch.Tensor, None], ...]:
         """ScaledUpperTriangMaskedSoftmax bwd"""
         softmax_results, scale_t = ctx.saved_tensors
+
+        # Collect backward histogram
+        from .histogram_collector import get_histogram_collector
+        collector = get_histogram_collector()
+        if collector is not None:
+            collector.collect_backward(ctx.layer_number, output_grads)
+
         input_grads = tex.scaled_upper_triang_masked_softmax_backward(
             output_grads, softmax_results, scale_t[0]
         )
 
-        return input_grads, None
+        return input_grads, None, None
 
 
 class ScaledAlignedCausalMaskedSoftmax(torch.autograd.Function):
@@ -72,22 +80,30 @@ class ScaledAlignedCausalMaskedSoftmax(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, inputs: torch.Tensor, scale: float) -> torch.Tensor:
+    def forward(ctx, inputs: torch.Tensor, scale: float, layer_number: int = 0) -> torch.Tensor:
         """ScaledAlignedCausalMaskedSoftmax fwd"""
         scale_t = torch.tensor([scale])
         softmax_results = tex.scaled_aligned_causal_masked_softmax_forward(inputs, scale_t[0])
         ctx.save_for_backward(softmax_results, scale_t)
+        ctx.layer_number = layer_number
         return softmax_results
 
     @staticmethod
     def backward(ctx, output_grads: torch.Tensor) -> Tuple[Union[torch.Tensor, None], ...]:
         """ScaledAlignedCausalMaskedSoftmax bwd"""
         softmax_results, scale_t = ctx.saved_tensors
+
+        # Collect backward histogram
+        from .histogram_collector import get_histogram_collector
+        collector = get_histogram_collector()
+        if collector is not None:
+            collector.collect_backward(ctx.layer_number, output_grads)
+
         input_grads = tex.scaled_aligned_causal_masked_softmax_backward(
             output_grads, softmax_results, scale_t[0]
         )
 
-        return input_grads, None
+        return input_grads, None, None
 
 
 class ScaledMaskedSoftmax(torch.autograd.Function):
@@ -99,12 +115,13 @@ class ScaledMaskedSoftmax(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, inputs: torch.Tensor, mask: torch.Tensor, scale: float) -> torch.Tensor:
+    def forward(ctx, inputs: torch.Tensor, mask: torch.Tensor, scale: float, layer_number: int = 0) -> torch.Tensor:
         """ScaledMaskedSoftmax fwd"""
         scale_t = torch.tensor([scale])
 
         softmax_results = tex.scaled_masked_softmax_forward(inputs, mask, scale_t[0])
         ctx.save_for_backward(softmax_results, scale_t)
+        ctx.layer_number = layer_number
         return softmax_results
 
     @staticmethod
@@ -112,8 +129,14 @@ class ScaledMaskedSoftmax(torch.autograd.Function):
         """ScaledMaskedSoftmax bwd"""
         softmax_results, scale_t = ctx.saved_tensors
 
+        # Collect backward histogram
+        from .histogram_collector import get_histogram_collector
+        collector = get_histogram_collector()
+        if collector is not None:
+            collector.collect_backward(ctx.layer_number, output_grads)
+
         input_grads = tex.scaled_masked_softmax_backward(output_grads, softmax_results, scale_t[0])
-        return input_grads, None, None
+        return input_grads, None, None, None
 
 
 class ScaledSoftmax(torch.autograd.Function):
@@ -124,18 +147,25 @@ class ScaledSoftmax(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, inputs: torch.Tensor, scale: float) -> torch.Tensor:
+    def forward(ctx, inputs: torch.Tensor, scale: float, layer_number: int = 0) -> torch.Tensor:
         """ScaledSoftmax fwd"""
         scale_t = torch.tensor([scale])
 
         softmax_results = tex.scaled_softmax_forward(inputs, scale_t[0])
         ctx.save_for_backward(softmax_results, scale_t)
+        ctx.layer_number = layer_number
         return softmax_results
 
     @staticmethod
     def backward(ctx, output_grads: torch.Tensor) -> Tuple[Union[torch.Tensor, None], ...]:
         """ScaledSoftmax bwd"""
         softmax_results, scale_t = ctx.saved_tensors
+
+        # Collect backward histogram
+        from .histogram_collector import get_histogram_collector
+        collector = get_histogram_collector()
+        if collector is not None:
+            collector.collect_backward(ctx.layer_number, output_grads)
 
         input_grads = tex.scaled_softmax_backward(output_grads, softmax_results, scale_t[0])
         return input_grads, None, None
@@ -235,15 +265,16 @@ class FusedScaleMaskSoftmax(nn.Module):
           arbitrary ([1, 1, sq, sk] or [b, 1, sq, sk])         | ScaledMaskedSoftmax
         """
         scale = 1.0 if scale is None else scale
+        layer_number = getattr(self, 'layer_number', 0)
 
         # Disable for now until unalignment bug is fixed.
         # if self.attn_mask_type in ["causal", "causal_bottom_right"]:
-        #    return ScaledAlignedCausalMaskedSoftmax.apply(inp, scale)
+        #    return ScaledAlignedCausalMaskedSoftmax.apply(inp, scale, layer_number)
 
         # input is 4D tensor (1, 1, sq, sk) or (b, 1, sq, sk)
         if mask is not None and self.attn_mask_type != "no_mask":
-            return ScaledMaskedSoftmax.apply(inp, mask, scale)
-        return ScaledSoftmax.apply(inp, scale)
+            return ScaledMaskedSoftmax.apply(inp, mask, scale, layer_number)
+        return ScaledSoftmax.apply(inp, scale, layer_number)
 
     def forward_torch_softmax(
         self, inp: torch.Tensor, mask: torch.Tensor, scale: Optional[float] = None
@@ -267,6 +298,17 @@ class FusedScaleMaskSoftmax(nn.Module):
         if mask is not None and self.attn_mask_type != "no_mask":
             mask_output = self.mask_func(inp, mask)
         probs = torch.nn.functional.softmax(mask_output, dim=-1)
+
+        # Register backward hook for gradient collection
+        if probs.requires_grad:
+            layer_number = getattr(self, 'layer_number', 0)
+            def backward_hook(grad):
+                from .histogram_collector import get_histogram_collector
+                collector = get_histogram_collector()
+                if collector is not None:
+                    collector.collect_backward(layer_number, grad)
+                return grad
+            probs.register_hook(backward_hook)
 
         if self.input_in_float16 and self.softmax_in_fp32:
             if self.input_in_fp16:

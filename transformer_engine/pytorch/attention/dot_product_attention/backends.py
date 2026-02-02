@@ -282,6 +282,7 @@ class UnfusedDotProductAttention(torch.nn.Module):
 
         self.mask_func = mask_func
         self.scale_mask_softmax = FusedScaleMaskSoftmax(mask_func)
+        self.scale_mask_softmax.layer_number = layer_number
 
         # Dropout. Note that for a single iteration, this layer will generate
         # different outputs on different number of parallel partitions but
@@ -552,6 +553,12 @@ class UnfusedDotProductAttention(torch.nn.Module):
         attention_probs = self.scale_mask_softmax(
             matmul_result, attention_mask, attn_mask_type, softmax_scale
         )
+
+        # Collect forward histogram
+        from .histogram_collector import get_histogram_collector
+        collector = get_histogram_collector()
+        if collector is not None and self.layer_number is not None:
+            collector.collect_forward(self.layer_number, attention_probs)
 
         # mask out the pad positions in softmax results, mostly for the rows (pad tokens from q)
         # the columns (pad tokens from k) are already zeroed out during softmax
