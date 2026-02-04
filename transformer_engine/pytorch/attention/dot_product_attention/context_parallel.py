@@ -1886,17 +1886,25 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         elif not use_fused_attention:
             out = out.view(-1, *out.shape[-2:])
 
-        # update FP8 quantizers: amax across cp_size steps AND across CP ranks
+        # update FP8 quantizers: amax across cp_size steps
         if fp8 and use_fused_attention:
             amax_cp_fwd = amax_per_step.amax(dim=1)
-            # Synchronize amax across all CP ranks to ensure consistent scaling factors.
-            # This is critical for GQA models (like Llama 3.1 405B) where different ranks
-            # see different attention patterns due to sequence partitioning, leading to
-            # different amax values. Without this synchronization, inconsistent scaling
-            # factors cause numerical drift and convergence issues.
-            torch.distributed.all_reduce(
-                amax_cp_fwd, op=torch.distributed.ReduceOp.MAX, group=cp_group
-            )
+            # Synchronize amax across CP ranks for current scaling.
+            # Each CP rank computes attention on different sequence chunks, resulting in
+            # different local amax values for S (softmax scores) and O (attention output).
+            # Without synchronization, ranks will have inconsistent scaling factors,
+            # causing numerical divergence that accumulates over training iterations.
+            # This is especially critical for large models with high GQA ratios (e.g., 405B)
+            # where attention score variance across sequence partitions is more pronounced.
+            if fp8_recipe.float8_current_scaling():
+                # For a2a+p2p, cp_group is a list [a2a_group, p2p_group];
+                # use a2a_group since ranks in the same a2a group have the same heads
+                amax_reduction_group = cp_group[0] if isinstance(cp_group, list) else cp_group
+                torch.distributed.all_reduce(
+                    amax_cp_fwd,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=amax_reduction_group,
+                )
             S_quantizer.amax.copy_(amax_cp_fwd[0])
             O_quantizer.amax.copy_(amax_cp_fwd[1])
 
@@ -2619,14 +2627,24 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         # sum up all cp_size for dq, dk, dv
         if ctx.fp8 and ctx.use_fused_attention:
             amax_cp_bwd = amax_per_step.amax(dim=1)
-            # Synchronize amax across all CP ranks to ensure consistent scaling factors.
-            # This is critical for GQA models (like Llama 3.1 405B) where different ranks
-            # see different gradient patterns due to sequence partitioning, leading to
-            # different amax values. Without this synchronization, inconsistent scaling
-            # factors cause gradient instability and convergence issues.
-            torch.distributed.all_reduce(
-                amax_cp_bwd, op=torch.distributed.ReduceOp.MAX, group=ctx.cp_group
-            )
+            # Synchronize amax across CP ranks for current scaling.
+            # Each CP rank computes gradients on different sequence chunks, resulting in
+            # different local amax values for dP and dQKV. Without synchronization, ranks
+            # will have inconsistent scaling factors for gradient tensors, causing numerical
+            # divergence that accumulates over training iterations. This is especially
+            # critical for large models with high GQA ratios (e.g., 405B) where gradient
+            # variance across sequence partitions is more pronounced.
+            if ctx.fp8_recipe.float8_current_scaling():
+                # For a2a+p2p, cp_group is a list [a2a_group, p2p_group];
+                # use a2a_group since ranks in the same a2a group have the same heads
+                amax_reduction_group = (
+                    ctx.cp_group[0] if isinstance(ctx.cp_group, list) else ctx.cp_group
+                )
+                torch.distributed.all_reduce(
+                    amax_cp_bwd,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=amax_reduction_group,
+                )
             ctx.dP_quantizer.amax.copy_(amax_cp_bwd[0])
             ctx.dQKV_quantizer.amax.copy_(amax_cp_bwd[1])
 
