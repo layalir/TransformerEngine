@@ -1886,9 +1886,17 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         elif not use_fused_attention:
             out = out.view(-1, *out.shape[-2:])
 
-        # update FP8 quantizers: amax across cp_size steps
+        # update FP8 quantizers: amax across cp_size steps AND across CP ranks
         if fp8 and use_fused_attention:
             amax_cp_fwd = amax_per_step.amax(dim=1)
+            # Synchronize amax across all CP ranks to ensure consistent scaling factors.
+            # This is critical for GQA models (like Llama 3.1 405B) where different ranks
+            # see different attention patterns due to sequence partitioning, leading to
+            # different amax values. Without this synchronization, inconsistent scaling
+            # factors cause numerical drift and convergence issues.
+            torch.distributed.all_reduce(
+                amax_cp_fwd, op=torch.distributed.ReduceOp.MAX, group=cp_group
+            )
             S_quantizer.amax.copy_(amax_cp_fwd[0])
             O_quantizer.amax.copy_(amax_cp_fwd[1])
 
@@ -2611,6 +2619,14 @@ class AttnFuncWithCPAndKVP2P(torch.autograd.Function):
         # sum up all cp_size for dq, dk, dv
         if ctx.fp8 and ctx.use_fused_attention:
             amax_cp_bwd = amax_per_step.amax(dim=1)
+            # Synchronize amax across all CP ranks to ensure consistent scaling factors.
+            # This is critical for GQA models (like Llama 3.1 405B) where different ranks
+            # see different gradient patterns due to sequence partitioning, leading to
+            # different amax values. Without this synchronization, inconsistent scaling
+            # factors cause gradient instability and convergence issues.
+            torch.distributed.all_reduce(
+                amax_cp_bwd, op=torch.distributed.ReduceOp.MAX, group=ctx.cp_group
+            )
             ctx.dP_quantizer.amax.copy_(amax_cp_bwd[0])
             ctx.dQKV_quantizer.amax.copy_(amax_cp_bwd[1])
 
