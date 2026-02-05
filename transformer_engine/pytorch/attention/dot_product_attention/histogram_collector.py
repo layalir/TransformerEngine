@@ -51,54 +51,17 @@ class SoftmaxHistogramCollector:
         # Step counter for periodic output
         self.step_count = 0
 
-    def _compute_histogram_bf16_compatible(
-        self, data: torch.Tensor, num_bins: int, min_val: float, max_val: float
-    ) -> torch.Tensor:
-        """
-        Compute histogram using BFloat16-compatible operations.
+        # ==========================================================================
+        # PERFORMANCE TUNING: Sampling rate for histogram collection
+        # For large models (e.g., 405B), computing histograms on full tensors is
+        # extremely slow. We sample every Nth element to maintain ~15s/step speed.
+        # Increase this value if training is still slow.
+        # ==========================================================================
+        self.sample_stride = int(os.getenv("NVTE_HISTOGRAM_SAMPLE_STRIDE", "1000"))
 
-        Uses torch.bucketize for bin assignment, which supports BFloat16,
-        then counts elements per bin using torch.bincount.
-
-        Args:
-            data: Flattened input tensor (any dtype including BFloat16)
-            num_bins: Number of histogram bins
-            min_val: Minimum value for histogram range
-            max_val: Maximum value for histogram range
-
-        Returns:
-            Histogram counts tensor of shape (num_bins,)
-        """
-        # Create bin edges on the same device as data
-        # Use float32 for bin edges for precision, bucketize handles dtype conversion
-        bin_edges = torch.linspace(
-            min_val, max_val, num_bins + 1, device=data.device, dtype=torch.float32
-        )
-
-        # Clamp data to range to handle edge cases
-        # These operations work with BFloat16
-        clamped_data = data.clamp(min=min_val, max=max_val)
-
-        # bucketize returns bin indices (0 to num_bins)
-        # right=False means bins are [edge[i], edge[i+1])
-        # We need to convert to float32 for bucketize comparison precision
-        bin_indices = torch.bucketize(clamped_data.float(), bin_edges, right=False)
-
-        # Adjust indices: bucketize can return num_bins for values == max_val
-        # We want these in the last bin (index num_bins - 1)
-        bin_indices = bin_indices.clamp(max=num_bins - 1)
-
-        # For values at exactly min_val, bucketize with right=False returns 0,
-        # but we want them in bin 0, so subtract 1 for indices > 0 where value < edge
-        # Actually, bucketize returns the index where value would be inserted,
-        # so for [0, 0.02, 0.04, ...], value 0.0 returns 0, value 0.01 returns 1
-        # We need to subtract 1 for indices > 0 to get the correct bin
-        bin_indices = (bin_indices - 1).clamp(min=0)
-
-        # Count elements in each bin
-        hist = torch.bincount(bin_indices, minlength=num_bins)
-
-        return hist[:num_bins]  # Ensure exactly num_bins elements
+        # Only collect every N forward passes (per layer) to reduce overhead
+        self.collect_frequency = int(os.getenv("NVTE_HISTOGRAM_COLLECT_FREQ", "1"))
+        self._layer_call_counts: Dict[int, int] = {}
 
     def collect_forward(self, layer_id: int, probs: torch.Tensor) -> None:
         """
@@ -108,15 +71,26 @@ class SoftmaxHistogramCollector:
             layer_id: Layer identifier for per-layer tracking
             probs: Softmax output tensor (values in [0, 1])
         """
-        with torch.no_grad():
-            # Flatten tensor - works with BFloat16
-            flat_probs = probs.flatten()
+        # Track call count per layer for frequency-based collection
+        if layer_id not in self._layer_call_counts:
+            self._layer_call_counts[layer_id] = 0
+        self._layer_call_counts[layer_id] += 1
 
-            # Use BFloat16-compatible histogram computation
+        # Skip collection based on frequency setting
+        if self._layer_call_counts[layer_id] % self.collect_frequency != 0:
+            return
+
+        with torch.no_grad():
+            # ==========================================================================
+            # PERFORMANCE FIX: Sample tensor instead of processing all elements
+            # For a 405B model, full tensor histogram was causing >10min/step.
+            # Sampling every Nth element preserves distribution while being fast.
+            # ==========================================================================
+            flat_probs = probs.flatten()[::self.sample_stride].float()
+
+            # Use torch.histc with float32 (fast path)
             # Fixed range [0, 1] for softmax outputs
-            hist = self._compute_histogram_bf16_compatible(
-                flat_probs, self.num_bins, min_val=0.0, max_val=1.0
-            )
+            hist = torch.histc(flat_probs, bins=self.num_bins, min=0.0, max=1.0)
 
             with self.lock:
                 # Initialize storage for this layer if needed
@@ -145,11 +119,20 @@ class SoftmaxHistogramCollector:
             layer_id: Layer identifier for per-layer tracking
             grad: Gradient tensor flowing through softmax
         """
-        with torch.no_grad():
-            # Flatten gradients - works with BFloat16
-            flat_grad = grad.flatten()
+        # Skip collection based on frequency setting (use same counter as forward)
+        if layer_id in self._layer_call_counts:
+            if self._layer_call_counts[layer_id] % self.collect_frequency != 0:
+                return
 
-            # Compute dynamic range (min/max work with BFloat16)
+        with torch.no_grad():
+            # ==========================================================================
+            # PERFORMANCE FIX: Sample tensor instead of processing all elements
+            # For a 405B model, full tensor histogram was causing >10min/step.
+            # Sampling every Nth element preserves distribution while being fast.
+            # ==========================================================================
+            flat_grad = grad.flatten()[::self.sample_stride].float()
+
+            # Compute dynamic range on sampled data
             min_val = flat_grad.min().item()
             max_val = flat_grad.max().item()
 
@@ -160,10 +143,8 @@ class SoftmaxHistogramCollector:
                 min_val = center - 1e-5
                 max_val = center + 1e-5
 
-            # Use BFloat16-compatible histogram computation
-            hist = self._compute_histogram_bf16_compatible(
-                flat_grad, self.num_bins, min_val=min_val, max_val=max_val
-            )
+            # Use torch.histc with float32 (fast path)
+            hist = torch.histc(flat_grad, bins=self.num_bins, min=min_val, max=max_val)
 
             with self.lock:
                 # Initialize storage for this layer if needed
