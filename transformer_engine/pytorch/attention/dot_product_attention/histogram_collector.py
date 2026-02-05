@@ -258,9 +258,13 @@ def get_histogram_collector() -> Optional[SoftmaxHistogramCollector]:
     """
     global _collector
 
-    # Check if collection is enabled
-    if not int(os.getenv("NVTE_COLLECT_SOFTMAX_HISTOGRAM", "0")):
-        return None
+    # ==========================================================================
+    # DEBUG MODIFICATION: Always enable histogram collection
+    # Original code checked: if not int(os.getenv("NVTE_COLLECT_SOFTMAX_HISTOGRAM", "0")): return None
+    # To restore original behavior, uncomment the following two lines:
+    # if not int(os.getenv("NVTE_COLLECT_SOFTMAX_HISTOGRAM", "0")):
+    #     return None
+    # ==========================================================================
 
     # Lazy initialization with double-checked locking
     if _collector is None:

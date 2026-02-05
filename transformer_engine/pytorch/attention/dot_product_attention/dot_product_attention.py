@@ -1380,13 +1380,42 @@ class DotProductAttention(TransformerEngineBaseModule):
                 use_fused_attention = False
                 use_unfused_attention = True
             else:
-                if (
+                # ======================================================================
+                # DEBUG MODIFICATION: Force UnfusedDotProductAttention backend
+                # This bypasses the normal backend selection logic to always use
+                # unfused attention for debugging/analysis purposes.
+                #
+                # To restore original behavior, set _FORCE_UNFUSED_ATTENTION = False
+                # or delete this block and uncomment the original code below.
+                # ======================================================================
+                _FORCE_UNFUSED_ATTENTION = True
+
+                if _FORCE_UNFUSED_ATTENTION:
+                    use_flash_attention = False
+                    use_fused_attention = False
+                    use_unfused_attention = True
+                    flash_attention_backend = None
+                    fused_attention_backend = None
+                    # Log once when backend selection would normally update
+                    if (
+                        _attention_backends["attention_params"] is None
+                        or attention_params != _attention_backends["attention_params"]
+                    ):
+                        _attention_backends["attention_params"] = attention_params
+                        self.logger.info(
+                            "DEBUG MODE: Forcing UnfusedDotProductAttention backend "
+                            "(normal backend selection bypassed)"
+                        )
+                # ======================================================================
+                # Original backend selection code (currently bypassed):
+                # ======================================================================
+                elif (
                     _attention_backends["attention_params"] is None
                     or attention_params != _attention_backends["attention_params"]
                 ):
                     _attention_backends["attention_params"] = attention_params
                     _attention_backends["backend_selection_requires_update"] = True
-                if _attention_backends["backend_selection_requires_update"]:
+                if not _FORCE_UNFUSED_ATTENTION and _attention_backends["backend_selection_requires_update"]:
                     (
                         use_flash_attention,
                         flash_attention_backend,
@@ -1415,7 +1444,7 @@ class DotProductAttention(TransformerEngineBaseModule):
                         )
                     elif use_unfused_attention:
                         self.logger.info("Running with UnfusedDotProductAttention backend")
-                else:
+                elif not _FORCE_UNFUSED_ATTENTION:
                     use_flash_attention = _attention_backends["use_flash_attention"]
                     flash_attention_backend = _attention_backends["flash_attention_backend"]
                     use_fused_attention = _attention_backends["use_fused_attention"]
