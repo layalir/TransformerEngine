@@ -1,14 +1,12 @@
 """
-Histogram collection infrastructure for softmax analysis in attention mechanisms.
-
-This module provides thread-safe histogram collection for forward and backward passes
-through the softmax operation in UnfusedDotProductAttention. Controlled via environment
-variables, it has zero overhead when disabled.
+Histogram collection for softmax analysis in attention mechanisms.
 
 Environment variables:
-- NVTE_COLLECT_SOFTMAX_HISTOGRAM: Set to "1" to enable collection
 - NVTE_HISTOGRAM_BINS: Number of histogram bins (default: 50)
 - NVTE_HISTOGRAM_OUTPUT_FREQ: Output frequency in steps (default: 100)
+- NVTE_HISTOGRAM_SAMPLE_STRIDE: Sample every Nth element (default: 1000)
+- NVTE_HISTOGRAM_LAYER_FREQ: Collect every Nth layer (default: 1)
+- NVTE_HISTOGRAM_DEBUG: Enable debug prints (default: 0)
 """
 
 import os
@@ -18,179 +16,175 @@ import torch
 
 
 class SoftmaxHistogramCollector:
-    """
-    Thread-safe collector for softmax forward and backward pass histograms.
-
-    Accumulates per-layer histograms over time and provides table formatting
-    for analysis output.
-    """
+    """Thread-safe collector for softmax forward and backward pass histograms."""
 
     def __init__(self, num_bins: int = 50, output_freq: int = 100):
-        """
-        Initialize the histogram collector.
-
-        Args:
-            num_bins: Number of bins for histogram (default: 50)
-            output_freq: Output frequency in steps (default: 100)
-        """
         self.num_bins = num_bins
         self.output_freq = output_freq
 
-        # Per-layer histogram storage
-        # forward_histograms[layer_id] = tensor of shape (num_bins,)
+        # Histogram storage
         self.forward_histograms: Dict[int, torch.Tensor] = {}
         self.forward_bin_edges: Dict[int, torch.Tensor] = {}
-
-        # backward_histograms[layer_id] = tensor of shape (num_bins,)
         self.backward_histograms: Dict[int, torch.Tensor] = {}
         self.backward_ranges: Dict[int, Tuple[float, float]] = {}
 
-        # Thread safety
         self.lock = threading.Lock()
 
-        # Step counter for periodic output
-        self.step_count = 0
-
-        # ==========================================================================
-        # PERFORMANCE TUNING: Sampling rate for histogram collection
-        # For large models (e.g., 405B), computing histograms on full tensors is
-        # extremely slow. We sample every Nth element to maintain ~15s/step speed.
-        # Increase this value if training is still slow.
-        # ==========================================================================
+        # Performance tuning
         self.sample_stride = int(os.getenv("NVTE_HISTOGRAM_SAMPLE_STRIDE", "1000"))
+        self.layer_freq = int(os.getenv("NVTE_HISTOGRAM_LAYER_FREQ", "1"))
+        self.debug = os.getenv("NVTE_HISTOGRAM_DEBUG", "0") == "1"
 
-        # Only collect every N forward passes (per layer) to reduce overhead
-        self.collect_frequency = int(os.getenv("NVTE_HISTOGRAM_COLLECT_FREQ", "1"))
-        self._layer_call_counts: Dict[int, int] = {}
+        # Step tracking (auto-detect based on layer_id=1 appearing)
+        self._current_step = 0
+        self._seen_layer_1_this_step = False
+
+    def _debug_print(self, msg: str) -> None:
+        if self.debug:
+            print(f"[HISTO] {msg}", flush=True)
+
+    def _should_collect_layer(self, layer_id: int) -> bool:
+        return (layer_id % self.layer_freq) == 0
+
+    def _is_output_step(self) -> bool:
+        return (self._current_step % self.output_freq) == 0
+
+    def _check_new_step(self, layer_id: int) -> None:
+        """Auto-detect new step when layer_id=1 is seen again."""
+        if layer_id == 1:
+            if self._seen_layer_1_this_step:
+                # Seeing layer 1 again means new step
+                self._current_step += 1
+                self._seen_layer_1_this_step = True
+                self._debug_print(f"new_step detected step={self._current_step}")
+            else:
+                # First time seeing layer 1 this step
+                self._seen_layer_1_this_step = True
+                if self._current_step == 0:
+                    self._current_step = 1
+                    self._debug_print(f"first_step step={self._current_step}")
 
     def collect_forward(self, layer_id: int, probs: torch.Tensor) -> None:
-        """
-        Collect forward pass histogram (softmax output probabilities).
+        """Collect forward pass histogram (softmax output probabilities)."""
+        self._debug_print(f"enter collect_forward layer={layer_id}")
 
-        Args:
-            layer_id: Layer identifier for per-layer tracking
-            probs: Softmax output tensor (values in [0, 1])
-        """
-        # Track call count per layer for frequency-based collection
-        if layer_id not in self._layer_call_counts:
-            self._layer_call_counts[layer_id] = 0
-        self._layer_call_counts[layer_id] += 1
+        self._check_new_step(layer_id)
 
-        # Skip collection based on frequency setting
-        if self._layer_call_counts[layer_id] % self.collect_frequency != 0:
+        # Only collect on output steps
+        if not self._is_output_step():
+            self._debug_print(f"skip layer={layer_id} (step {self._current_step} not output step)")
             return
 
-        with torch.no_grad():
-            # ==========================================================================
-            # PERFORMANCE FIX: Sample tensor instead of processing all elements
-            # For a 405B model, full tensor histogram was causing >10min/step.
-            # Sampling every Nth element preserves distribution while being fast.
-            # ==========================================================================
-            flat_probs = probs.flatten()[::self.sample_stride].float()
+        # Skip layers based on layer_freq
+        if not self._should_collect_layer(layer_id):
+            self._debug_print(f"skip layer={layer_id} (layer_freq)")
+            return
 
-            # Use torch.histc with float32 (fast path)
-            # Fixed range [0, 1] for softmax outputs
+        self._debug_print(f"collecting forward layer={layer_id}")
+
+        with torch.no_grad():
+            self._debug_print(f"before flatten layer={layer_id}")
+            flat_probs = probs.flatten()[::self.sample_stride].float()
+            self._debug_print(f"after flatten layer={layer_id} size={flat_probs.numel()}")
+
+            self._debug_print(f"before histc layer={layer_id}")
             hist = torch.histc(flat_probs, bins=self.num_bins, min=0.0, max=1.0)
+            self._debug_print(f"after histc layer={layer_id}")
 
             with self.lock:
-                # Initialize storage for this layer if needed
                 if layer_id not in self.forward_histograms:
                     self.forward_histograms[layer_id] = torch.zeros(
                         self.num_bins, dtype=torch.long
                     )
-                    # Store bin edges for later display
                     self.forward_bin_edges[layer_id] = torch.linspace(
                         0.0, 1.0, self.num_bins + 1
                     )
-
-                # Accumulate counts
                 self.forward_histograms[layer_id] += hist.cpu().long()
 
-                # Increment step counter and check for output
-                self.step_count += 1
-                if self.step_count % self.output_freq == 0:
-                    self._output_table()
+        self._debug_print(f"done collect_forward layer={layer_id}")
 
     def collect_backward(self, layer_id: int, grad: torch.Tensor) -> None:
-        """
-        Collect backward pass histogram (gradients through softmax).
+        """Collect backward pass histogram (gradients through softmax)."""
+        self._debug_print(f"enter collect_backward layer={layer_id}")
 
-        Args:
-            layer_id: Layer identifier for per-layer tracking
-            grad: Gradient tensor flowing through softmax
-        """
-        # Skip collection based on frequency setting (use same counter as forward)
-        if layer_id in self._layer_call_counts:
-            if self._layer_call_counts[layer_id] % self.collect_frequency != 0:
-                return
+        # Only collect on output steps
+        if not self._is_output_step():
+            self._debug_print(f"skip backward layer={layer_id} (not output step)")
+            return
+
+        # Skip layers based on layer_freq
+        if not self._should_collect_layer(layer_id):
+            self._debug_print(f"skip backward layer={layer_id} (layer_freq)")
+            return
+
+        self._debug_print(f"collecting backward layer={layer_id}")
 
         with torch.no_grad():
-            # ==========================================================================
-            # PERFORMANCE FIX: Sample tensor instead of processing all elements
-            # For a 405B model, full tensor histogram was causing >10min/step.
-            # Sampling every Nth element preserves distribution while being fast.
-            # ==========================================================================
+            self._debug_print(f"before flatten layer={layer_id}")
             flat_grad = grad.flatten()[::self.sample_stride].float()
+            self._debug_print(f"after flatten layer={layer_id} size={flat_grad.numel()}")
 
-            # Compute dynamic range on sampled data
+            self._debug_print(f"before min/max layer={layer_id}")
             min_val = flat_grad.min().item()
             max_val = flat_grad.max().item()
+            self._debug_print(f"after min/max layer={layer_id}")
 
-            # Avoid degenerate case where all gradients are the same
             if abs(max_val - min_val) < 1e-10:
-                # Use a small range around the value
                 center = (max_val + min_val) / 2
                 min_val = center - 1e-5
                 max_val = center + 1e-5
 
-            # Use torch.histc with float32 (fast path)
+            self._debug_print(f"before histc layer={layer_id}")
             hist = torch.histc(flat_grad, bins=self.num_bins, min=min_val, max=max_val)
+            self._debug_print(f"after histc layer={layer_id}")
 
             with self.lock:
-                # Initialize storage for this layer if needed
                 if layer_id not in self.backward_histograms:
                     self.backward_histograms[layer_id] = torch.zeros(
                         self.num_bins, dtype=torch.long
                     )
                     self.backward_ranges[layer_id] = (min_val, max_val)
                 else:
-                    # Update range to encompass all observed values
                     old_min, old_max = self.backward_ranges[layer_id]
                     self.backward_ranges[layer_id] = (
                         min(old_min, min_val),
                         max(old_max, max_val)
                     )
-
-                # Accumulate counts
                 self.backward_histograms[layer_id] += hist.cpu().long()
 
+        # Output after last layer backward on output steps
+        if layer_id == 1 and self._is_output_step():
+            self._debug_print("outputting histogram table")
+            self._output_table()
+            self._reset_histograms()
+
+        self._debug_print(f"done collect_backward layer={layer_id}")
+
     def _format_number(self, num: int) -> str:
-        """Format large numbers with comma separators."""
         return f"{num:,}"
 
     def _output_table(self) -> None:
-        """Print histogram table to stdout."""
         table = self.get_table()
         if table:
             print(table, flush=True)
 
-    def get_table(self) -> str:
-        """
-        Generate formatted table string for all collected histograms.
+    def _reset_histograms(self) -> None:
+        with self.lock:
+            self.forward_histograms.clear()
+            self.forward_bin_edges.clear()
+            self.backward_histograms.clear()
+            self.backward_ranges.clear()
 
-        Returns:
-            Formatted string containing histogram tables
-        """
+    def get_table(self) -> str:
         with self.lock:
             if not self.forward_histograms and not self.backward_histograms:
                 return ""
 
             lines = []
             lines.append("=" * 80)
-            lines.append(f"SOFTMAX HISTOGRAM ANALYSIS (Step {self.step_count})")
+            lines.append(f"SOFTMAX HISTOGRAM ANALYSIS (Step {self._current_step})")
             lines.append("=" * 80)
 
-            # Forward pass histograms
             if self.forward_histograms:
                 lines.append("")
                 lines.append("--- FORWARD PASS (Softmax Output) ---")
@@ -199,7 +193,6 @@ class SoftmaxHistogramCollector:
                 for layer_id in sorted(self.forward_histograms.keys()):
                     hist = self.forward_histograms[layer_id]
                     edges = self.forward_bin_edges[layer_id]
-
                     total_samples = hist.sum().item()
 
                     lines.append(f"Layer {layer_id}:")
@@ -208,24 +201,19 @@ class SoftmaxHistogramCollector:
                     lines.append(f"  {'Bin Start':<12} | {'Bin End':<12} | {'Count':<15} | {'Percentage':<10}")
                     lines.append("  " + "-" * 60)
 
-                    # Show top 10 bins by count
                     top_indices = torch.topk(hist, min(10, self.num_bins)).indices
-
                     for idx in top_indices:
                         idx = idx.item()
                         bin_start = edges[idx].item()
                         bin_end = edges[idx + 1].item()
                         count = hist[idx].item()
                         percentage = 100.0 * count / total_samples if total_samples > 0 else 0.0
-
                         lines.append(
                             f"  {bin_start:<12.4f} | {bin_end:<12.4f} | "
                             f"{self._format_number(count):<15} | {percentage:>6.2f}%"
                         )
-
                     lines.append("")
 
-            # Backward pass histograms
             if self.backward_histograms:
                 lines.append("")
                 lines.append("--- BACKWARD PASS (dSoftmax Gradient) ---")
@@ -234,10 +222,7 @@ class SoftmaxHistogramCollector:
                 for layer_id in sorted(self.backward_histograms.keys()):
                     hist = self.backward_histograms[layer_id]
                     min_val, max_val = self.backward_ranges[layer_id]
-
                     total_samples = hist.sum().item()
-
-                    # Compute bin edges for this range
                     edges = torch.linspace(min_val, max_val, self.num_bins + 1)
 
                     lines.append(f"Layer {layer_id}:")
@@ -246,62 +231,40 @@ class SoftmaxHistogramCollector:
                     lines.append(f"  {'Bin Start':<12} | {'Bin End':<12} | {'Count':<15} | {'Percentage':<10}")
                     lines.append("  " + "-" * 60)
 
-                    # Show top 10 bins by count
                     top_indices = torch.topk(hist, min(10, self.num_bins)).indices
-
                     for idx in top_indices:
                         idx = idx.item()
                         bin_start = edges[idx].item()
                         bin_end = edges[idx + 1].item()
                         count = hist[idx].item()
                         percentage = 100.0 * count / total_samples if total_samples > 0 else 0.0
-
                         lines.append(
                             f"  {bin_start:<12.6f} | {bin_end:<12.6f} | "
                             f"{self._format_number(count):<15} | {percentage:>6.2f}%"
                         )
-
                     lines.append("")
 
             lines.append("=" * 80)
             return "\n".join(lines)
 
     def reset(self) -> None:
-        """Clear all collected histogram data."""
-        with self.lock:
-            self.forward_histograms.clear()
-            self.forward_bin_edges.clear()
-            self.backward_histograms.clear()
-            self.backward_ranges.clear()
-            self.step_count = 0
+        self._reset_histograms()
+        self._current_step = 0
+        self._seen_layer_1_this_step = False
 
 
-# Global singleton instance
+# Global singleton
 _collector: Optional[SoftmaxHistogramCollector] = None
 _collector_lock = threading.Lock()
 
 
 def get_histogram_collector() -> Optional[SoftmaxHistogramCollector]:
-    """
-    Get the global histogram collector singleton.
-
-    Returns None if histogram collection is disabled via environment variable.
-    Lazy initialization on first call.
-
-    Returns:
-        SoftmaxHistogramCollector instance if enabled, None otherwise
-    """
+    """Get the global histogram collector singleton."""
     global _collector
 
-    # ==========================================================================
-    # DEBUG MODIFICATION: Always enable histogram collection
-    # Original code checked: if not int(os.getenv("NVTE_COLLECT_SOFTMAX_HISTOGRAM", "0")): return None
-    # To restore original behavior, uncomment the following two lines:
-    # if not int(os.getenv("NVTE_COLLECT_SOFTMAX_HISTOGRAM", "0")):
-    #     return None
-    # ==========================================================================
+    # DEBUG: Always enable (remove env check)
+    # To restore: if not int(os.getenv("NVTE_COLLECT_SOFTMAX_HISTOGRAM", "0")): return None
 
-    # Lazy initialization with double-checked locking
     if _collector is None:
         with _collector_lock:
             if _collector is None:
@@ -311,5 +274,4 @@ def get_histogram_collector() -> Optional[SoftmaxHistogramCollector]:
                     num_bins=num_bins,
                     output_freq=output_freq
                 )
-
     return _collector
