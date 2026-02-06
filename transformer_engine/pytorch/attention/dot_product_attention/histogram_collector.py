@@ -45,8 +45,8 @@ class SoftmaxHistogramCollector:
         # Performance tuning
         self.sample_stride = int(os.getenv("NVTE_HISTOGRAM_SAMPLE_STRIDE", "10000"))
         self.layer_freq = int(os.getenv("NVTE_HISTOGRAM_LAYER_FREQ", "1"))
-        self.collect_forward = os.getenv("NVTE_HISTOGRAM_COLLECT_FORWARD", "1") == "1"
-        self.collect_backward = os.getenv("NVTE_HISTOGRAM_COLLECT_BACKWARD", "1") == "1"
+        self.collect_forward_enabled = os.getenv("NVTE_HISTOGRAM_COLLECT_FORWARD", "1") == "1"
+        self.collect_backward_enabled = os.getenv("NVTE_HISTOGRAM_COLLECT_BACKWARD", "1") == "1"
         self.debug = os.getenv("NVTE_HISTOGRAM_DEBUG", "0") == "1"
 
         # Step tracking (auto-detect based on layer_id=1 appearing)
@@ -125,7 +125,7 @@ class SoftmaxHistogramCollector:
         )
 
         # Check if forward collection is enabled
-        if not self.collect_forward:
+        if not self.collect_forward_enabled:
             self._debug_print(f"skip layer={layer_id} (forward collection disabled)")
             return
 
@@ -174,7 +174,7 @@ class SoftmaxHistogramCollector:
         )
 
         # Check if backward collection is enabled
-        if not self.collect_backward:
+        if not self.collect_backward_enabled:
             self._debug_print(f"skip backward layer={layer_id} (backward collection disabled)")
             # Still check for output trigger even if not collecting
             if layer_id == 1 and self._is_output_step():
