@@ -1388,17 +1388,26 @@ class DotProductAttention(TransformerEngineBaseModule):
                 # ======================================================================
                 _force_unfused_env = os.getenv("NVTE_FORCE_UNFUSED_LAYERS", "all")
                 _force_unfused_for_this_layer = False
+                _force_unfused_debug = os.getenv("NVTE_HISTOGRAM_DEBUG", "0") == "1"
 
                 if _force_unfused_env and _force_unfused_env.lower() != "none":
                     if _force_unfused_env.lower() == "all":
                         _force_unfused_for_this_layer = True
+                        if _force_unfused_debug:
+                            print(f"[BACKEND] layer={self.layer_number} env=all FORCING_UNFUSED=True", flush=True)
                     else:
                         # Parse comma-separated layer list
                         try:
                             _forced_layers = set(int(x.strip()) for x in _force_unfused_env.split(",") if x.strip())
                             _force_unfused_for_this_layer = self.layer_number in _forced_layers
-                        except ValueError:
-                            pass  # Invalid format, don't force
+                            if _force_unfused_debug:
+                                print(f"[BACKEND] layer={self.layer_number} env={_force_unfused_env} forced_layers={_forced_layers} FORCING_UNFUSED={_force_unfused_for_this_layer}", flush=True)
+                        except ValueError as e:
+                            if _force_unfused_debug:
+                                print(f"[BACKEND] layer={self.layer_number} ERROR parsing env: {e}", flush=True)
+                else:
+                    if _force_unfused_debug:
+                        print(f"[BACKEND] layer={self.layer_number} env={_force_unfused_env!r} FORCING_UNFUSED=False (disabled)", flush=True)
 
                 if _force_unfused_for_this_layer:
                     use_flash_attention = False
@@ -1406,10 +1415,8 @@ class DotProductAttention(TransformerEngineBaseModule):
                     use_unfused_attention = True
                     flash_attention_backend = None
                     fused_attention_backend = None
-                    self.logger.debug(
-                        "DEBUG MODE: Forcing UnfusedDotProductAttention for layer %d",
-                        self.layer_number
-                    )
+                    if _force_unfused_debug:
+                        print(f"[BACKEND] layer={self.layer_number} SELECTED=UnfusedDotProductAttention (forced)", flush=True)
                 # ======================================================================
                 # Original backend selection code:
                 # ======================================================================

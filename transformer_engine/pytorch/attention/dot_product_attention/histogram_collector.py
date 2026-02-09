@@ -87,25 +87,35 @@ class SoftmaxHistogramCollector:
         self._total_fwd_calls += 1
         call_num = self._total_fwd_calls
 
-        if self.debug:
-            tensor_info = self._get_tensor_info(probs)
-            self._debug_print(
-                f"collect_forward layer={layer_id} call={call_num} {tensor_info}"
+        # ALWAYS print on first few calls to confirm collector is being called
+        if call_num <= 5 or self.debug:
+            tensor_info = self._get_tensor_info(probs) if self.debug else f"shape={list(probs.shape)}"
+            print(
+                f"[HISTO] collect_forward CALLED layer={layer_id} call={call_num} {tensor_info}",
+                flush=True
             )
 
         # Check if forward collection is enabled
         if not self.collect_forward_enabled:
+            if self.debug:
+                self._debug_print(f"SKIP layer={layer_id} reason=forward_collection_disabled")
             return
 
         # Only collect every output_freq calls
-        if not self._should_collect_now():
+        should_collect = self._should_collect_now()
+        if self.debug:
+            self._debug_print(f"layer={layer_id} call={call_num} output_freq={self.output_freq} should_collect={should_collect}")
+        if not should_collect:
             return
 
         # Skip layers based on layer_freq
-        if not self._should_collect_layer(layer_id):
+        should_collect_layer = self._should_collect_layer(layer_id)
+        if self.debug:
+            self._debug_print(f"layer={layer_id} layer_freq={self.layer_freq} should_collect_layer={should_collect_layer}")
+        if not should_collect_layer:
             return
 
-        self._debug_print(f"COLLECTING forward layer={layer_id} call={call_num}")
+        print(f"[HISTO] >>> COLLECTING forward layer={layer_id} call={call_num} <<<", flush=True)
 
         with torch.no_grad():
             flat_probs = probs.flatten()[::self.sample_stride].float()
@@ -127,10 +137,12 @@ class SoftmaxHistogramCollector:
         self._total_bwd_calls += 1
         call_num = self._total_bwd_calls
 
-        if self.debug:
-            tensor_info = self._get_tensor_info(grad)
-            self._debug_print(
-                f"collect_backward layer={layer_id} call={call_num} {tensor_info}"
+        # ALWAYS print on first few calls to confirm collector is being called
+        if call_num <= 5 or self.debug:
+            tensor_info = self._get_tensor_info(grad) if self.debug else f"shape={list(grad.shape)}"
+            print(
+                f"[HISTO] collect_backward CALLED layer={layer_id} call={call_num} {tensor_info}",
+                flush=True
             )
 
         # Check if backward collection is enabled
@@ -303,4 +315,17 @@ def get_histogram_collector() -> Optional[SoftmaxHistogramCollector]:
                     num_bins=num_bins,
                     output_freq=output_freq
                 )
+                # Print initialization message
+                debug = os.getenv("NVTE_HISTOGRAM_DEBUG", "0") == "1"
+                if debug:
+                    print("=" * 70, flush=True)
+                    print("[HISTO] HISTOGRAM COLLECTOR INITIALIZED", flush=True)
+                    print(f"[HISTO]   num_bins={num_bins}", flush=True)
+                    print(f"[HISTO]   output_freq={output_freq}", flush=True)
+                    print(f"[HISTO]   sample_stride={_collector.sample_stride}", flush=True)
+                    print(f"[HISTO]   layer_freq={_collector.layer_freq}", flush=True)
+                    print(f"[HISTO]   collect_forward_enabled={_collector.collect_forward_enabled}", flush=True)
+                    print(f"[HISTO]   collect_backward_enabled={_collector.collect_backward_enabled}", flush=True)
+                    print(f"[HISTO]   debug={_collector.debug}", flush=True)
+                    print("=" * 70, flush=True)
     return _collector
