@@ -554,19 +554,11 @@ class UnfusedDotProductAttention(torch.nn.Module):
             matmul_result, attention_mask, attn_mask_type, softmax_scale
         )
 
-        # Collect forward histogram
+        # Collect forward histogram for softmax analysis
         from .histogram_collector import get_histogram_collector
-        import os as _os
-        _histo_debug = _os.getenv("NVTE_HISTOGRAM_DEBUG", "0") == "1"
-        if _histo_debug:
-            print(f"[HISTO] UnfusedDotProductAttention.forward layer={self.layer_number} - about to call get_histogram_collector()", flush=True)
         collector = get_histogram_collector()
-        if _histo_debug:
-            print(f"[HISTO] UnfusedDotProductAttention.forward layer={self.layer_number} collector={collector} layer_number={self.layer_number}", flush=True)
         if collector is not None and self.layer_number is not None:
             collector.collect_forward(self.layer_number, attention_probs)
-        elif _histo_debug:
-            print(f"[HISTO] UnfusedDotProductAttention.forward layer={self.layer_number} SKIPPED: collector={collector is not None} layer_number={self.layer_number is not None}", flush=True)
 
         # mask out the pad positions in softmax results, mostly for the rows (pad tokens from q)
         # the columns (pad tokens from k) are already zeroed out during softmax

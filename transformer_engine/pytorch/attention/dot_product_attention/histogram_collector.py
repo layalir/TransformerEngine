@@ -3,15 +3,13 @@ Histogram collection for softmax analysis in attention mechanisms.
 
 Environment variables:
 - NVTE_HISTOGRAM_BINS: Number of histogram bins (default: 50)
-- NVTE_HISTOGRAM_OUTPUT_FREQ: Output every N forward calls (default: 1000)
+- NVTE_HISTOGRAM_OUTPUT_FREQ: Output every N forward calls on THIS rank (default: 1)
 - NVTE_HISTOGRAM_SAMPLE_STRIDE: Sample every Nth element (default: 10000)
 - NVTE_HISTOGRAM_LAYER_FREQ: Collect every Nth layer (default: 1)
 - NVTE_HISTOGRAM_COLLECT_FORWARD: Enable forward collection (default: 1)
 - NVTE_HISTOGRAM_COLLECT_BACKWARD: Enable backward collection (default: 1)
 - NVTE_HISTOGRAM_DEBUG: Enable debug prints (default: 0)
-
-Note: OUTPUT_FREQ counts forward pass calls, not training steps.
-With micro-batches and pipeline parallelism, one training step has many forward calls.
+- NVTE_HISTOGRAM_OUTPUT_RANK: Only this rank outputs tables (default: 0, set -1 for all ranks)
 """
 
 import os
@@ -52,24 +50,13 @@ class SoftmaxHistogramCollector:
         self.collect_backward_enabled = os.getenv("NVTE_HISTOGRAM_COLLECT_BACKWARD", "1") == "1"
         self.debug = os.getenv("NVTE_HISTOGRAM_DEBUG", "0") == "1"
 
+        # Only allow specific rank to output (default: rank 0, set -1 for all ranks)
+        self.output_rank = int(os.getenv("NVTE_HISTOGRAM_OUTPUT_RANK", "0"))
+
         # Simple call counter (no step detection - just count forward calls)
         self._total_fwd_calls = 0
         self._total_bwd_calls = 0
         self._last_output_at = 0
-
-    def _debug_print(self, msg: str) -> None:
-        if self.debug:
-            print(f"[HISTO] {msg}", flush=True)
-
-    def _get_tensor_info(self, tensor: torch.Tensor) -> str:
-        """Get tensor shape and device info for debug prints."""
-        shape_str = list(tensor.shape)
-        device = str(tensor.device)
-        rank = _get_rank()
-        numel = tensor.numel()
-        sampled_size = numel // self.sample_stride
-        mem_kb = (sampled_size * 4) / 1024
-        return f"shape={shape_str} device={device} rank={rank} mem_est={mem_kb:.1f}KB"
 
     def _should_collect_layer(self, layer_id: int) -> bool:
         return (layer_id % self.layer_freq) == 0
@@ -85,37 +72,15 @@ class SoftmaxHistogramCollector:
     def collect_forward(self, layer_id: int, probs: torch.Tensor) -> None:
         """Collect forward pass histogram (softmax output probabilities)."""
         self._total_fwd_calls += 1
-        call_num = self._total_fwd_calls
 
-        # ALWAYS print on first few calls to confirm collector is being called
-        if call_num <= 5 or self.debug:
-            tensor_info = self._get_tensor_info(probs) if self.debug else f"shape={list(probs.shape)}"
-            print(
-                f"[HISTO] collect_forward CALLED layer={layer_id} call={call_num} {tensor_info}",
-                flush=True
-            )
-
-        # Check if forward collection is enabled
         if not self.collect_forward_enabled:
-            if self.debug:
-                self._debug_print(f"SKIP layer={layer_id} reason=forward_collection_disabled")
             return
 
-        # Only collect every output_freq calls
-        should_collect = self._should_collect_now()
-        if self.debug:
-            self._debug_print(f"layer={layer_id} call={call_num} output_freq={self.output_freq} should_collect={should_collect}")
-        if not should_collect:
+        if not self._should_collect_now():
             return
 
-        # Skip layers based on layer_freq
-        should_collect_layer = self._should_collect_layer(layer_id)
-        if self.debug:
-            self._debug_print(f"layer={layer_id} layer_freq={self.layer_freq} should_collect_layer={should_collect_layer}")
-        if not should_collect_layer:
+        if not self._should_collect_layer(layer_id):
             return
-
-        print(f"[HISTO] >>> COLLECTING forward layer={layer_id} call={call_num} <<<", flush=True)
 
         with torch.no_grad():
             flat_probs = probs.flatten()[::self.sample_stride].float()
@@ -132,35 +97,20 @@ class SoftmaxHistogramCollector:
                     )
                 self.forward_histograms[layer_id] += hist.cpu().long()
 
+        self._do_output()
+
     def collect_backward(self, layer_id: int, grad: torch.Tensor) -> None:
         """Collect backward pass histogram (gradients through softmax)."""
         self._total_bwd_calls += 1
-        call_num = self._total_bwd_calls
 
-        # ALWAYS print on first few calls to confirm collector is being called
-        if call_num <= 5 or self.debug:
-            tensor_info = self._get_tensor_info(grad) if self.debug else f"shape={list(grad.shape)}"
-            print(
-                f"[HISTO] collect_backward CALLED layer={layer_id} call={call_num} {tensor_info}",
-                flush=True
-            )
-
-        # Check if backward collection is enabled
         if not self.collect_backward_enabled:
-            # Check for output trigger
-            if layer_id == 1 and self._should_output_now() and self.forward_histograms:
-                self._do_output()
             return
 
-        # Only collect when forward is also collecting
         if not self._should_collect_now():
             return
 
-        # Skip layers based on layer_freq
         if not self._should_collect_layer(layer_id):
             return
-
-        self._debug_print(f"COLLECTING backward layer={layer_id} call={call_num}")
 
         with torch.no_grad():
             flat_grad = grad.flatten()[::self.sample_stride].float()
@@ -189,24 +139,27 @@ class SoftmaxHistogramCollector:
                     )
                 self.backward_histograms[layer_id] += hist.cpu().long()
 
-        # Output after layer 1 backward (last layer in backward order)
-        if layer_id == 1 and self._should_output_now():
-            self._do_output()
+    def _can_output(self) -> bool:
+        """Check if this rank is allowed to output."""
+        if self.output_rank == -1:
+            return True
+        current_rank = _get_rank()
+        if current_rank == -1:
+            return True
+        return current_rank == self.output_rank
 
     def _do_output(self) -> None:
         """Output histogram table and reset."""
-        self._debug_print(f"OUTPUT at fwd_call={self._total_fwd_calls}")
-        self._output_table()
+        if self._can_output():
+            table = self.get_table()
+            if table:
+                print(table, flush=True)
+
         self._reset_histograms()
         self._last_output_at = self._total_fwd_calls
 
     def _format_number(self, num: int) -> str:
         return f"{num:,}"
-
-    def _output_table(self) -> None:
-        table = self.get_table()
-        if table:
-            print(table, flush=True)
 
     def _reset_histograms(self) -> None:
         with self.lock:
@@ -303,9 +256,6 @@ def get_histogram_collector() -> Optional[SoftmaxHistogramCollector]:
     """Get the global histogram collector singleton."""
     global _collector
 
-    # DEBUG: Always enable (remove env check)
-    # To restore: if not int(os.getenv("NVTE_COLLECT_SOFTMAX_HISTOGRAM", "0")): return None
-
     if _collector is None:
         with _collector_lock:
             if _collector is None:
@@ -315,17 +265,9 @@ def get_histogram_collector() -> Optional[SoftmaxHistogramCollector]:
                     num_bins=num_bins,
                     output_freq=output_freq
                 )
-                # Print initialization message
-                debug = os.getenv("NVTE_HISTOGRAM_DEBUG", "0") == "1"
-                if debug:
-                    print("=" * 70, flush=True)
-                    print("[HISTO] HISTOGRAM COLLECTOR INITIALIZED", flush=True)
-                    print(f"[HISTO]   num_bins={num_bins}", flush=True)
-                    print(f"[HISTO]   output_freq={output_freq}", flush=True)
-                    print(f"[HISTO]   sample_stride={_collector.sample_stride}", flush=True)
-                    print(f"[HISTO]   layer_freq={_collector.layer_freq}", flush=True)
-                    print(f"[HISTO]   collect_forward_enabled={_collector.collect_forward_enabled}", flush=True)
-                    print(f"[HISTO]   collect_backward_enabled={_collector.collect_backward_enabled}", flush=True)
-                    print(f"[HISTO]   debug={_collector.debug}", flush=True)
-                    print("=" * 70, flush=True)
+                if _collector.debug:
+                    rank = _get_rank()
+                    print(f"[HISTO] Initialized: rank={rank} bins={num_bins} freq={output_freq} "
+                          f"stride={_collector.sample_stride} output_rank={_collector.output_rank}",
+                          flush=True)
     return _collector
