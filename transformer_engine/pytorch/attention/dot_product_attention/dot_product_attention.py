@@ -1381,33 +1381,37 @@ class DotProductAttention(TransformerEngineBaseModule):
                 use_unfused_attention = True
             else:
                 # ======================================================================
-                # DEBUG MODIFICATION: Force UnfusedDotProductAttention backend
-                # This bypasses the normal backend selection logic to always use
-                # unfused attention for debugging/analysis purposes.
-                #
-                # To restore original behavior, set _FORCE_UNFUSED_ATTENTION = False
-                # or delete this block and uncomment the original code below.
+                # DEBUG MODIFICATION: Force UnfusedDotProductAttention for specific layers
+                # Set NVTE_FORCE_UNFUSED_LAYERS="0,10,20" to force unfused for those layers
+                # Set NVTE_FORCE_UNFUSED_LAYERS="all" to force all layers (default)
+                # Leave unset or empty to disable forcing (use normal backend selection)
                 # ======================================================================
-                _FORCE_UNFUSED_ATTENTION = True
+                _force_unfused_env = os.getenv("NVTE_FORCE_UNFUSED_LAYERS", "all")
+                _force_unfused_for_this_layer = False
 
-                if _FORCE_UNFUSED_ATTENTION:
+                if _force_unfused_env and _force_unfused_env.lower() != "none":
+                    if _force_unfused_env.lower() == "all":
+                        _force_unfused_for_this_layer = True
+                    else:
+                        # Parse comma-separated layer list
+                        try:
+                            _forced_layers = set(int(x.strip()) for x in _force_unfused_env.split(",") if x.strip())
+                            _force_unfused_for_this_layer = self.layer_number in _forced_layers
+                        except ValueError:
+                            pass  # Invalid format, don't force
+
+                if _force_unfused_for_this_layer:
                     use_flash_attention = False
                     use_fused_attention = False
                     use_unfused_attention = True
                     flash_attention_backend = None
                     fused_attention_backend = None
-                    # Log once when backend selection would normally update
-                    if (
-                        _attention_backends["attention_params"] is None
-                        or attention_params != _attention_backends["attention_params"]
-                    ):
-                        _attention_backends["attention_params"] = attention_params
-                        self.logger.info(
-                            "DEBUG MODE: Forcing UnfusedDotProductAttention backend "
-                            "(normal backend selection bypassed)"
-                        )
+                    self.logger.debug(
+                        "DEBUG MODE: Forcing UnfusedDotProductAttention for layer %d",
+                        self.layer_number
+                    )
                 # ======================================================================
-                # Original backend selection code (currently bypassed):
+                # Original backend selection code:
                 # ======================================================================
                 elif (
                     _attention_backends["attention_params"] is None
@@ -1415,7 +1419,7 @@ class DotProductAttention(TransformerEngineBaseModule):
                 ):
                     _attention_backends["attention_params"] = attention_params
                     _attention_backends["backend_selection_requires_update"] = True
-                if not _FORCE_UNFUSED_ATTENTION and _attention_backends["backend_selection_requires_update"]:
+                if not _force_unfused_for_this_layer and _attention_backends["backend_selection_requires_update"]:
                     (
                         use_flash_attention,
                         flash_attention_backend,
@@ -1444,7 +1448,7 @@ class DotProductAttention(TransformerEngineBaseModule):
                         )
                     elif use_unfused_attention:
                         self.logger.info("Running with UnfusedDotProductAttention backend")
-                elif not _FORCE_UNFUSED_ATTENTION:
+                elif not _force_unfused_for_this_layer:
                     use_flash_attention = _attention_backends["use_flash_attention"]
                     flash_attention_backend = _attention_backends["flash_attention_backend"]
                     use_fused_attention = _attention_backends["use_fused_attention"]

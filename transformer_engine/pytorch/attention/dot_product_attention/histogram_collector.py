@@ -3,12 +3,15 @@ Histogram collection for softmax analysis in attention mechanisms.
 
 Environment variables:
 - NVTE_HISTOGRAM_BINS: Number of histogram bins (default: 50)
-- NVTE_HISTOGRAM_OUTPUT_FREQ: Output frequency in steps (default: 100)
+- NVTE_HISTOGRAM_OUTPUT_FREQ: Output every N forward calls (default: 1000)
 - NVTE_HISTOGRAM_SAMPLE_STRIDE: Sample every Nth element (default: 10000)
 - NVTE_HISTOGRAM_LAYER_FREQ: Collect every Nth layer (default: 1)
 - NVTE_HISTOGRAM_COLLECT_FORWARD: Enable forward collection (default: 1)
 - NVTE_HISTOGRAM_COLLECT_BACKWARD: Enable backward collection (default: 1)
 - NVTE_HISTOGRAM_DEBUG: Enable debug prints (default: 0)
+
+Note: OUTPUT_FREQ counts forward pass calls, not training steps.
+With micro-batches and pipeline parallelism, one training step has many forward calls.
 """
 
 import os
@@ -30,7 +33,7 @@ def _get_rank() -> int:
 class SoftmaxHistogramCollector:
     """Thread-safe collector for softmax forward and backward pass histograms."""
 
-    def __init__(self, num_bins: int = 50, output_freq: int = 100):
+    def __init__(self, num_bins: int = 50, output_freq: int = 1000):
         self.num_bins = num_bins
         self.output_freq = output_freq
 
@@ -49,13 +52,10 @@ class SoftmaxHistogramCollector:
         self.collect_backward_enabled = os.getenv("NVTE_HISTOGRAM_COLLECT_BACKWARD", "1") == "1"
         self.debug = os.getenv("NVTE_HISTOGRAM_DEBUG", "0") == "1"
 
-        # Step tracking (auto-detect based on layer_id=1 appearing)
-        self._current_step = 0
-        self._seen_layer_1_this_step = False
-
-        # Per-layer call counters for debugging (reset each step)
-        self._fwd_call_counts: Dict[int, int] = {}
-        self._bwd_call_counts: Dict[int, int] = {}
+        # Simple call counter (no step detection - just count forward calls)
+        self._total_fwd_calls = 0
+        self._total_bwd_calls = 0
+        self._last_output_at = 0
 
     def _debug_print(self, msg: str) -> None:
         if self.debug:
@@ -68,88 +68,49 @@ class SoftmaxHistogramCollector:
         rank = _get_rank()
         numel = tensor.numel()
         sampled_size = numel // self.sample_stride
-        mem_kb = (sampled_size * 4) / 1024  # float32 = 4 bytes
+        mem_kb = (sampled_size * 4) / 1024
         return f"shape={shape_str} device={device} rank={rank} mem_est={mem_kb:.1f}KB"
-
-    def _get_fwd_call_count(self, layer_id: int) -> int:
-        """Increment and return forward call count for this layer."""
-        if layer_id not in self._fwd_call_counts:
-            self._fwd_call_counts[layer_id] = 0
-        self._fwd_call_counts[layer_id] += 1
-        return self._fwd_call_counts[layer_id]
-
-    def _get_bwd_call_count(self, layer_id: int) -> int:
-        """Increment and return backward call count for this layer."""
-        if layer_id not in self._bwd_call_counts:
-            self._bwd_call_counts[layer_id] = 0
-        self._bwd_call_counts[layer_id] += 1
-        return self._bwd_call_counts[layer_id]
-
-    def _reset_call_counts(self) -> None:
-        """Reset per-layer call counters (called at step boundary)."""
-        self._fwd_call_counts.clear()
-        self._bwd_call_counts.clear()
 
     def _should_collect_layer(self, layer_id: int) -> bool:
         return (layer_id % self.layer_freq) == 0
 
-    def _is_output_step(self) -> bool:
-        return (self._current_step % self.output_freq) == 0
+    def _should_collect_now(self) -> bool:
+        """Check if we should collect based on total forward calls."""
+        return (self._total_fwd_calls % self.output_freq) == 0
 
-    def _check_new_step(self, layer_id: int) -> None:
-        """Auto-detect new step when layer_id=1 is seen again."""
-        if layer_id == 1:
-            if self._seen_layer_1_this_step:
-                # Seeing layer 1 again means new step
-                self._current_step += 1
-                self._seen_layer_1_this_step = True
-                self._reset_call_counts()
-                self._debug_print(f"new_step detected step={self._current_step}")
-            else:
-                # First time seeing layer 1 this step
-                self._seen_layer_1_this_step = True
-                if self._current_step == 0:
-                    self._current_step = 1
-                    self._reset_call_counts()
-                    self._debug_print(f"first_step step={self._current_step}")
+    def _should_output_now(self) -> bool:
+        """Check if we should output (after collecting enough data)."""
+        return self._total_fwd_calls > 0 and self._total_fwd_calls > self._last_output_at
 
     def collect_forward(self, layer_id: int, probs: torch.Tensor) -> None:
         """Collect forward pass histogram (softmax output probabilities)."""
-        self._check_new_step(layer_id)
-        call_num = self._get_fwd_call_count(layer_id)
-        tensor_info = self._get_tensor_info(probs) if self.debug else ""
+        self._total_fwd_calls += 1
+        call_num = self._total_fwd_calls
 
-        self._debug_print(
-            f"collect_forward layer={layer_id} step={self._current_step} "
-            f"call={call_num} {tensor_info}"
-        )
+        if self.debug:
+            tensor_info = self._get_tensor_info(probs)
+            self._debug_print(
+                f"collect_forward layer={layer_id} call={call_num} {tensor_info}"
+            )
 
         # Check if forward collection is enabled
         if not self.collect_forward_enabled:
-            self._debug_print(f"skip layer={layer_id} (forward collection disabled)")
             return
 
-        # Only collect on output steps
-        if not self._is_output_step():
-            self._debug_print(f"skip layer={layer_id} (step {self._current_step} not output step)")
+        # Only collect every output_freq calls
+        if not self._should_collect_now():
             return
 
         # Skip layers based on layer_freq
         if not self._should_collect_layer(layer_id):
-            self._debug_print(f"skip layer={layer_id} (layer_freq)")
             return
 
-        self._debug_print(f"collecting forward layer={layer_id} call={call_num}")
+        self._debug_print(f"COLLECTING forward layer={layer_id} call={call_num}")
 
         with torch.no_grad():
-            self._debug_print(f"before flatten layer={layer_id} call={call_num}")
             flat_probs = probs.flatten()[::self.sample_stride].float()
-            self._debug_print(f"after flatten layer={layer_id} call={call_num} size={flat_probs.numel()}")
-
-            self._debug_print(f"before histc layer={layer_id} call={call_num}")
             hist = torch.histc(flat_probs, bins=self.num_bins, min=0.0, max=1.0)
-            del flat_probs  # Explicit cleanup to free GPU memory immediately
-            self._debug_print(f"after histc layer={layer_id} call={call_num}")
+            del flat_probs
 
             with self.lock:
                 if layer_id not in self.forward_histograms:
@@ -161,59 +122,46 @@ class SoftmaxHistogramCollector:
                     )
                 self.forward_histograms[layer_id] += hist.cpu().long()
 
-        self._debug_print(f"done collect_forward layer={layer_id} call={call_num}")
-
     def collect_backward(self, layer_id: int, grad: torch.Tensor) -> None:
         """Collect backward pass histogram (gradients through softmax)."""
-        call_num = self._get_bwd_call_count(layer_id)
-        tensor_info = self._get_tensor_info(grad) if self.debug else ""
+        self._total_bwd_calls += 1
+        call_num = self._total_bwd_calls
 
-        self._debug_print(
-            f"collect_backward layer={layer_id} step={self._current_step} "
-            f"call={call_num} {tensor_info}"
-        )
+        if self.debug:
+            tensor_info = self._get_tensor_info(grad)
+            self._debug_print(
+                f"collect_backward layer={layer_id} call={call_num} {tensor_info}"
+            )
 
         # Check if backward collection is enabled
         if not self.collect_backward_enabled:
-            self._debug_print(f"skip backward layer={layer_id} (backward collection disabled)")
-            # Still check for output trigger even if not collecting
-            if layer_id == 1 and self._is_output_step():
-                self._debug_print("outputting histogram table")
-                self._output_table()
-                self._reset_histograms()
+            # Check for output trigger
+            if layer_id == 1 and self._should_output_now() and self.forward_histograms:
+                self._do_output()
             return
 
-        # Only collect on output steps
-        if not self._is_output_step():
-            self._debug_print(f"skip backward layer={layer_id} (not output step)")
+        # Only collect when forward is also collecting
+        if not self._should_collect_now():
             return
 
         # Skip layers based on layer_freq
         if not self._should_collect_layer(layer_id):
-            self._debug_print(f"skip backward layer={layer_id} (layer_freq)")
             return
 
-        self._debug_print(f"collecting backward layer={layer_id} call={call_num}")
+        self._debug_print(f"COLLECTING backward layer={layer_id} call={call_num}")
 
         with torch.no_grad():
-            self._debug_print(f"before flatten layer={layer_id} call={call_num}")
             flat_grad = grad.flatten()[::self.sample_stride].float()
-            self._debug_print(f"after flatten layer={layer_id} call={call_num} size={flat_grad.numel()}")
-
-            self._debug_print(f"before min/max layer={layer_id} call={call_num}")
             min_val = flat_grad.min().item()
             max_val = flat_grad.max().item()
-            self._debug_print(f"after min/max layer={layer_id} call={call_num}")
 
             if abs(max_val - min_val) < 1e-10:
                 center = (max_val + min_val) / 2
                 min_val = center - 1e-5
                 max_val = center + 1e-5
 
-            self._debug_print(f"before histc layer={layer_id} call={call_num}")
             hist = torch.histc(flat_grad, bins=self.num_bins, min=min_val, max=max_val)
-            del flat_grad  # Explicit cleanup to free GPU memory immediately
-            self._debug_print(f"after histc layer={layer_id} call={call_num}")
+            del flat_grad
 
             with self.lock:
                 if layer_id not in self.backward_histograms:
@@ -229,13 +177,16 @@ class SoftmaxHistogramCollector:
                     )
                 self.backward_histograms[layer_id] += hist.cpu().long()
 
-        # Output after last layer backward on output steps
-        if layer_id == 1 and self._is_output_step():
-            self._debug_print("outputting histogram table")
-            self._output_table()
-            self._reset_histograms()
+        # Output after layer 1 backward (last layer in backward order)
+        if layer_id == 1 and self._should_output_now():
+            self._do_output()
 
-        self._debug_print(f"done collect_backward layer={layer_id} call={call_num}")
+    def _do_output(self) -> None:
+        """Output histogram table and reset."""
+        self._debug_print(f"OUTPUT at fwd_call={self._total_fwd_calls}")
+        self._output_table()
+        self._reset_histograms()
+        self._last_output_at = self._total_fwd_calls
 
     def _format_number(self, num: int) -> str:
         return f"{num:,}"
@@ -259,7 +210,7 @@ class SoftmaxHistogramCollector:
 
             lines = []
             lines.append("=" * 80)
-            lines.append(f"SOFTMAX HISTOGRAM ANALYSIS (Step {self._current_step})")
+            lines.append(f"SOFTMAX HISTOGRAM (fwd_calls={self._total_fwd_calls} bwd_calls={self._total_bwd_calls})")
             lines.append("=" * 80)
 
             if self.forward_histograms:
@@ -326,8 +277,9 @@ class SoftmaxHistogramCollector:
 
     def reset(self) -> None:
         self._reset_histograms()
-        self._current_step = 0
-        self._seen_layer_1_this_step = False
+        self._total_fwd_calls = 0
+        self._total_bwd_calls = 0
+        self._last_output_at = 0
 
 
 # Global singleton
@@ -346,7 +298,7 @@ def get_histogram_collector() -> Optional[SoftmaxHistogramCollector]:
         with _collector_lock:
             if _collector is None:
                 num_bins = int(os.getenv("NVTE_HISTOGRAM_BINS", "50"))
-                output_freq = int(os.getenv("NVTE_HISTOGRAM_OUTPUT_FREQ", "100"))
+                output_freq = int(os.getenv("NVTE_HISTOGRAM_OUTPUT_FREQ", "1000"))
                 _collector = SoftmaxHistogramCollector(
                     num_bins=num_bins,
                     output_freq=output_freq
