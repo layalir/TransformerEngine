@@ -7,53 +7,26 @@ Environment variables:
 - NVTE_HISTOGRAM_SAMPLE_STRIDE: Sample every Nth element (default: 10000)
 - NVTE_HISTOGRAM_LAYER_FREQ: Collect every Nth layer (default: 1)
 - NVTE_HISTOGRAM_COLLECT_FORWARD: Enable forward collection (default: 1)
-- NVTE_HISTOGRAM_COLLECT_BACKWARD: Enable backward collection (default: 1)
+- NVTE_HISTOGRAM_COLLECT_BACKWARD: Enable backward collection (default: 0)
 - NVTE_HISTOGRAM_DEBUG: Enable debug prints (default: 0)
-- NVTE_HISTOGRAM_OUTPUT_RANK: Only this rank outputs tables (default: 0, set -1 for all ranks)
+- NVTE_HISTOGRAM_OUTPUT_RANK: Which rank prints tables (default: -1 = all ranks print)
 - NVTE_HISTOGRAM_RESET_AFTER_OUTPUT: Clear buffers after output to bound memory (default: 1)
-- NVTE_HISTOGRAM_GATHER_TO_RANK0: Gather histograms from all ranks to rank 0 (default: 1)
-- NVTE_HISTOGRAM_MAX_LAYERS: Maximum number of layers to track (default: 256)
 """
 
 import os
 import threading
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Optional, Set, Tuple
 import torch
 
 
 def _get_rank() -> int:
-    """Get distributed rank if available, else -1."""
+    """Get distributed rank if available, else 0."""
     try:
         if torch.distributed.is_initialized():
             return torch.distributed.get_rank()
     except Exception:
         pass
-    return -1
-
-
-def _get_world_size() -> int:
-    """Get distributed world size if available, else 1."""
-    try:
-        if torch.distributed.is_initialized():
-            return torch.distributed.get_world_size()
-    except Exception:
-        pass
-    return 1
-
-
-def _is_distributed() -> bool:
-    """Check if distributed is initialized."""
-    try:
-        return torch.distributed.is_initialized()
-    except Exception:
-        return False
-
-
-def _get_cuda_device() -> torch.device:
-    """Get CUDA device for current rank."""
-    if torch.cuda.is_available():
-        return torch.device(f"cuda:{torch.cuda.current_device()}")
-    return torch.device("cpu")
+    return 0
 
 
 class SoftmaxHistogramCollector:
@@ -63,7 +36,7 @@ class SoftmaxHistogramCollector:
         self.num_bins = num_bins
         self.output_freq = output_freq
 
-        # Histogram storage
+        # Histogram storage (CPU tensors for memory efficiency)
         self.forward_histograms: Dict[int, torch.Tensor] = {}
         self.forward_bin_edges: Dict[int, torch.Tensor] = {}
         self.backward_histograms: Dict[int, torch.Tensor] = {}
@@ -75,22 +48,16 @@ class SoftmaxHistogramCollector:
         self.sample_stride = int(os.getenv("NVTE_HISTOGRAM_SAMPLE_STRIDE", "10000"))
         self.layer_freq = int(os.getenv("NVTE_HISTOGRAM_LAYER_FREQ", "1"))
         self.collect_forward_enabled = os.getenv("NVTE_HISTOGRAM_COLLECT_FORWARD", "1") == "1"
-        self.collect_backward_enabled = os.getenv("NVTE_HISTOGRAM_COLLECT_BACKWARD", "1") == "1"
+        self.collect_backward_enabled = os.getenv("NVTE_HISTOGRAM_COLLECT_BACKWARD", "0") == "1"
         self.debug = os.getenv("NVTE_HISTOGRAM_DEBUG", "0") == "1"
 
-        # Only allow specific rank to output (default: rank 0, set -1 for all ranks)
-        self.output_rank = int(os.getenv("NVTE_HISTOGRAM_OUTPUT_RANK", "0"))
+        # Output control: -1 = all ranks print, otherwise only specified rank prints
+        self.output_rank = int(os.getenv("NVTE_HISTOGRAM_OUTPUT_RANK", "-1"))
 
         # Memory management: reset buffers after output to bound memory usage
         self.reset_after_output = os.getenv("NVTE_HISTOGRAM_RESET_AFTER_OUTPUT", "1") == "1"
 
-        # Distributed gathering: collect histograms from all ranks to rank 0
-        self.gather_to_rank0 = os.getenv("NVTE_HISTOGRAM_GATHER_TO_RANK0", "1") == "1"
-
-        # Maximum layers to track (for distributed gather tensor sizing)
-        self.max_layers = int(os.getenv("NVTE_HISTOGRAM_MAX_LAYERS", "256"))
-
-        # Simple call counter (no step detection - just count forward calls)
+        # Call counter
         self._total_fwd_calls = 0
         self._total_bwd_calls = 0
         self._last_output_at = 0
@@ -99,11 +66,11 @@ class SoftmaxHistogramCollector:
         self._logged_fwd_layers: Set[int] = set()
         self._logged_bwd_layers: Set[int] = set()
 
-    def _debug_print(self, msg: str) -> None:
-        """Print debug message if debug mode is enabled."""
-        if self.debug:
-            rank = _get_rank()
-            print(f"[HISTO r{rank}] {msg}", flush=True)
+    def _can_output(self) -> bool:
+        """Check if this rank is allowed to output."""
+        if self.output_rank == -1:
+            return True
+        return _get_rank() == self.output_rank
 
     def _should_collect_layer(self, layer_id: int) -> bool:
         return (layer_id % self.layer_freq) == 0
@@ -111,10 +78,6 @@ class SoftmaxHistogramCollector:
     def _should_collect_now(self) -> bool:
         """Check if we should collect based on total forward calls."""
         return (self._total_fwd_calls % self.output_freq) == 0
-
-    def _should_output_now(self) -> bool:
-        """Check if we should output (after collecting enough data)."""
-        return self._total_fwd_calls > 0 and self._total_fwd_calls > self._last_output_at
 
     def collect_forward(self, layer_id: int, probs: torch.Tensor) -> None:
         """Collect forward pass histogram (softmax output probabilities)."""
@@ -132,9 +95,11 @@ class SoftmaxHistogramCollector:
         # Debug: log first time we collect each layer
         if self.debug and layer_id not in self._logged_fwd_layers:
             self._logged_fwd_layers.add(layer_id)
-            self._debug_print(f"Collecting forward for layer {layer_id} (first time)")
+            rank = _get_rank()
+            print(f"[HISTO r{rank}] Collecting forward for layer {layer_id}", flush=True)
 
         with torch.no_grad():
+            # Sample and compute histogram on GPU, then move to CPU
             flat_probs = probs.flatten()[::self.sample_stride].float()
             hist = torch.histc(flat_probs, bins=self.num_bins, min=0.0, max=1.0)
             del flat_probs
@@ -167,7 +132,8 @@ class SoftmaxHistogramCollector:
         # Debug: log first time we collect each layer
         if self.debug and layer_id not in self._logged_bwd_layers:
             self._logged_bwd_layers.add(layer_id)
-            self._debug_print(f"Collecting backward for layer {layer_id} (first time)")
+            rank = _get_rank()
+            print(f"[HISTO r{rank}] Collecting backward for layer {layer_id}", flush=True)
 
         with torch.no_grad():
             flat_grad = grad.flatten()[::self.sample_stride].float()
@@ -196,150 +162,13 @@ class SoftmaxHistogramCollector:
                     )
                 self.backward_histograms[layer_id] += hist.cpu().long()
 
-    def _can_output(self) -> bool:
-        """Check if this rank is allowed to output."""
-        if self.output_rank == -1:
-            return True
-        current_rank = _get_rank()
-        if current_rank == -1:
-            return True
-        return current_rank == self.output_rank
-
-    def _gather_histograms_to_rank0(self) -> Tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor]]:
-        """
-        Gather histograms from all ranks to rank 0.
-
-        Returns aggregated forward and backward histograms.
-        Only rank 0 gets meaningful data; other ranks get empty dicts.
-        """
-        if not _is_distributed():
-            return self.forward_histograms.copy(), self.backward_histograms.copy()
-
-        world_size = _get_world_size()
-        rank = _get_rank()
-        device = _get_cuda_device()
-
-        self._debug_print(f"Gathering histograms from {world_size} ranks...")
-
-        # Pack local forward histograms into a tensor
-        # Format: [layer_id, hist_bin_0, hist_bin_1, ..., hist_bin_N-1] for each layer
-        # Use -1 as layer_id to indicate empty slots
-        local_fwd_data = torch.full(
-            (self.max_layers, 1 + self.num_bins), -1, dtype=torch.long, device=device
-        )
-        with self.lock:
-            for i, (layer_id, hist) in enumerate(self.forward_histograms.items()):
-                if i >= self.max_layers:
-                    break
-                local_fwd_data[i, 0] = layer_id
-                local_fwd_data[i, 1:] = hist.to(device)
-
-        # Pack local backward histograms similarly
-        # Format: [layer_id, hist_bin_0, ..., hist_bin_N-1, min_val_bits, max_val_bits]
-        local_bwd_data = torch.full(
-            (self.max_layers, 1 + self.num_bins + 2), -1, dtype=torch.long, device=device
-        )
-        with self.lock:
-            for i, (layer_id, hist) in enumerate(self.backward_histograms.items()):
-                if i >= self.max_layers:
-                    break
-                local_bwd_data[i, 0] = layer_id
-                local_bwd_data[i, 1:1+self.num_bins] = hist.to(device)
-                if layer_id in self.backward_ranges:
-                    min_val, max_val = self.backward_ranges[layer_id]
-                    # Store floats as int bits (use float64 for precision)
-                    local_bwd_data[i, -2] = torch.tensor(min_val, dtype=torch.float64).view(torch.long).item()
-                    local_bwd_data[i, -1] = torch.tensor(max_val, dtype=torch.float64).view(torch.long).item()
-
-        # Gather all data to rank 0
-        if rank == 0:
-            gathered_fwd = [torch.zeros_like(local_fwd_data) for _ in range(world_size)]
-            gathered_bwd = [torch.zeros_like(local_bwd_data) for _ in range(world_size)]
-        else:
-            gathered_fwd = None
-            gathered_bwd = None
-
-        try:
-            torch.distributed.gather(local_fwd_data, gathered_fwd, dst=0)
-            torch.distributed.gather(local_bwd_data, gathered_bwd, dst=0)
-        except RuntimeError as e:
-            # If gather fails (e.g., backend issues), fall back to local data
-            self._debug_print(f"Gather failed: {e}, using local data only")
-            return self.forward_histograms.copy(), self.backward_histograms.copy()
-
-        # Aggregate on rank 0
-        aggregated_fwd: Dict[int, torch.Tensor] = {}
-        aggregated_bwd: Dict[int, torch.Tensor] = {}
-        aggregated_bwd_ranges: Dict[int, Tuple[float, float]] = {}
-
-        if rank == 0 and gathered_fwd is not None and gathered_bwd is not None:
-            # Aggregate forward histograms
-            for rank_data in gathered_fwd:
-                for row in rank_data:
-                    layer_id = row[0].item()
-                    if layer_id < 0:
-                        continue
-                    hist = row[1:].cpu()
-                    if layer_id not in aggregated_fwd:
-                        aggregated_fwd[layer_id] = torch.zeros(self.num_bins, dtype=torch.long)
-                    aggregated_fwd[layer_id] += hist
-
-            # Aggregate backward histograms
-            for rank_data in gathered_bwd:
-                for row in rank_data:
-                    layer_id = row[0].item()
-                    if layer_id < 0:
-                        continue
-                    hist = row[1:1+self.num_bins].cpu()
-                    min_bits = row[-2].item()
-                    max_bits = row[-1].item()
-                    min_val = torch.tensor(min_bits, dtype=torch.long).view(torch.float64).item()
-                    max_val = torch.tensor(max_bits, dtype=torch.long).view(torch.float64).item()
-
-                    if layer_id not in aggregated_bwd:
-                        aggregated_bwd[layer_id] = torch.zeros(self.num_bins, dtype=torch.long)
-                        aggregated_bwd_ranges[layer_id] = (min_val, max_val)
-                    else:
-                        old_min, old_max = aggregated_bwd_ranges[layer_id]
-                        aggregated_bwd_ranges[layer_id] = (
-                            min(old_min, min_val),
-                            max(old_max, max_val)
-                        )
-                    aggregated_bwd[layer_id] += hist
-
-            # Store ranges for table generation
-            self._aggregated_bwd_ranges = aggregated_bwd_ranges
-
-            self._debug_print(f"Aggregated data from {world_size} ranks: "
-                            f"{len(aggregated_fwd)} fwd layers, {len(aggregated_bwd)} bwd layers")
-
-        return aggregated_fwd, aggregated_bwd
-
     def _do_output(self) -> None:
         """Output histogram table and optionally reset buffers."""
-        current_rank = _get_rank()
+        if self._can_output():
+            table = self.get_table()
+            if table:
+                print(table, flush=True)
 
-        if self.gather_to_rank0 and _is_distributed():
-            self._debug_print("Output triggered (freq reached), starting gather...")
-
-            # Gather from all ranks, only rank 0 prints
-            fwd_histograms, bwd_histograms = self._gather_histograms_to_rank0()
-
-            if current_rank == 0:
-                table = self._get_table_from_data(fwd_histograms, bwd_histograms)
-                if table:
-                    print(table, flush=True)
-                    self._debug_print("Output complete")
-        else:
-            # Local-only mode: each rank handles its own data
-            if self._can_output():
-                self._debug_print("Output triggered (local mode)")
-                table = self.get_table()
-                if table:
-                    print(table, flush=True)
-                    self._debug_print("Output complete")
-
-        # Reset buffers to bound memory usage (default behavior)
         if self.reset_after_output:
             self._reset_histograms()
         self._last_output_at = self._total_fwd_calls
@@ -350,95 +179,10 @@ class SoftmaxHistogramCollector:
     def _reset_histograms(self) -> None:
         """Clear all histogram buffers and release memory."""
         with self.lock:
-            for tensor in self.forward_histograms.values():
-                del tensor
-            for tensor in self.forward_bin_edges.values():
-                del tensor
-            for tensor in self.backward_histograms.values():
-                del tensor
             self.forward_histograms.clear()
             self.forward_bin_edges.clear()
             self.backward_histograms.clear()
             self.backward_ranges.clear()
-
-    def _get_table_from_data(
-        self,
-        forward_histograms: Dict[int, torch.Tensor],
-        backward_histograms: Dict[int, torch.Tensor],
-    ) -> str:
-        """Generate table from provided histogram data (used after gathering)."""
-        if not forward_histograms and not backward_histograms:
-            return ""
-
-        world_size = _get_world_size()
-        lines = []
-        lines.append("=" * 80)
-        lines.append(f"SOFTMAX HISTOGRAM [AGGREGATED FROM {world_size} RANKS]")
-        lines.append(f"(fwd_calls={self._total_fwd_calls} bwd_calls={self._total_bwd_calls})")
-        lines.append("=" * 80)
-
-        if forward_histograms:
-            lines.append("")
-            lines.append("--- FORWARD PASS (Softmax Output) ---")
-            lines.append("")
-
-            edges = torch.linspace(0.0, 1.0, self.num_bins + 1)
-            for layer_id in sorted(forward_histograms.keys()):
-                hist = forward_histograms[layer_id]
-                total_samples = hist.sum().item()
-
-                lines.append(f"Layer {layer_id}:")
-                lines.append(f"  Total samples: {self._format_number(total_samples)}")
-                lines.append(f"  Bin Range [0.000, 1.000]")
-                lines.append(f"  {'Bin Start':<12} | {'Bin End':<12} | {'Count':<15} | {'Percentage':<10}")
-                lines.append("  " + "-" * 60)
-
-                top_indices = torch.topk(hist, min(10, self.num_bins)).indices
-                for idx in top_indices:
-                    idx = idx.item()
-                    bin_start = edges[idx].item()
-                    bin_end = edges[idx + 1].item()
-                    count = hist[idx].item()
-                    percentage = 100.0 * count / total_samples if total_samples > 0 else 0.0
-                    lines.append(
-                        f"  {bin_start:<12.4f} | {bin_end:<12.4f} | "
-                        f"{self._format_number(count):<15} | {percentage:>6.2f}%"
-                    )
-                lines.append("")
-
-        if backward_histograms:
-            lines.append("")
-            lines.append("--- BACKWARD PASS (dSoftmax Gradient) ---")
-            lines.append("")
-
-            bwd_ranges = getattr(self, '_aggregated_bwd_ranges', {})
-            for layer_id in sorted(backward_histograms.keys()):
-                hist = backward_histograms[layer_id]
-                min_val, max_val = bwd_ranges.get(layer_id, (0.0, 1.0))
-                total_samples = hist.sum().item()
-                edges = torch.linspace(min_val, max_val, self.num_bins + 1)
-
-                lines.append(f"Layer {layer_id}:")
-                lines.append(f"  Total samples: {self._format_number(total_samples)}")
-                lines.append(f"  Value range: [{min_val:.6f}, {max_val:.6f}]")
-                lines.append(f"  {'Bin Start':<12} | {'Bin End':<12} | {'Count':<15} | {'Percentage':<10}")
-                lines.append("  " + "-" * 60)
-
-                top_indices = torch.topk(hist, min(10, self.num_bins)).indices
-                for idx in top_indices:
-                    idx = idx.item()
-                    bin_start = edges[idx].item()
-                    bin_end = edges[idx + 1].item()
-                    count = hist[idx].item()
-                    percentage = 100.0 * count / total_samples if total_samples > 0 else 0.0
-                    lines.append(
-                        f"  {bin_start:<12.6f} | {bin_end:<12.6f} | "
-                        f"{self._format_number(count):<15} | {percentage:>6.2f}%"
-                    )
-                lines.append("")
-
-        lines.append("=" * 80)
-        return "\n".join(lines)
 
     def get_table(self) -> str:
         """Generate table from local histogram data."""
@@ -446,9 +190,11 @@ class SoftmaxHistogramCollector:
             if not self.forward_histograms and not self.backward_histograms:
                 return ""
 
+            rank = _get_rank()
             lines = []
             lines.append("=" * 80)
-            lines.append(f"SOFTMAX HISTOGRAM (fwd_calls={self._total_fwd_calls} bwd_calls={self._total_bwd_calls})")
+            lines.append(f"SOFTMAX HISTOGRAM [RANK {rank}]")
+            lines.append(f"(fwd_calls={self._total_fwd_calls} bwd_calls={self._total_bwd_calls})")
             lines.append("=" * 80)
 
             if self.forward_histograms:
@@ -542,9 +288,7 @@ def get_histogram_collector() -> Optional[SoftmaxHistogramCollector]:
                 )
                 if _collector.debug:
                     rank = _get_rank()
-                    world_size = _get_world_size()
-                    print(f"[HISTO r{rank}] Initialized: world_size={world_size} bins={num_bins} "
-                          f"freq={output_freq} stride={_collector.sample_stride} "
-                          f"gather={_collector.gather_to_rank0}",
+                    print(f"[HISTO r{rank}] Initialized: bins={num_bins} freq={output_freq} "
+                          f"stride={_collector.sample_stride} output_rank={_collector.output_rank}",
                           flush=True)
     return _collector
