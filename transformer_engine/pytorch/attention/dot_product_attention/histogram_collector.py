@@ -5,12 +5,14 @@ Environment variables:
 - NVTE_HISTOGRAM_BINS: Number of histogram bins (default: 50)
 - NVTE_HISTOGRAM_OUTPUT_FREQ: Output every N forward calls on THIS rank (default: 1000)
 - NVTE_HISTOGRAM_SAMPLE_STRIDE: Sample every Nth element (default: 10000)
-- NVTE_HISTOGRAM_LAYER_FREQ: Collect every Nth layer (default: 1)
 - NVTE_HISTOGRAM_COLLECT_FORWARD: Enable forward collection (default: 1)
 - NVTE_HISTOGRAM_COLLECT_BACKWARD: Enable backward collection (default: 0)
 - NVTE_HISTOGRAM_DEBUG: Enable debug prints (default: 0)
 - NVTE_HISTOGRAM_OUTPUT_RANK: Which rank prints tables (default: -1 = all ranks print)
 - NVTE_HISTOGRAM_RESET_AFTER_OUTPUT: Clear buffers after output to bound memory (default: 1)
+
+Note: Only layers using UnfusedDotProductAttention will have histograms collected.
+Use NVTE_FORCE_UNFUSED_LAYERS to control which layers are profiled.
 """
 
 import os
@@ -46,7 +48,6 @@ class SoftmaxHistogramCollector:
 
         # Performance tuning
         self.sample_stride = int(os.getenv("NVTE_HISTOGRAM_SAMPLE_STRIDE", "10000"))
-        self.layer_freq = int(os.getenv("NVTE_HISTOGRAM_LAYER_FREQ", "1"))
         self.collect_forward_enabled = os.getenv("NVTE_HISTOGRAM_COLLECT_FORWARD", "1") == "1"
         self.collect_backward_enabled = os.getenv("NVTE_HISTOGRAM_COLLECT_BACKWARD", "0") == "1"
         self.debug = os.getenv("NVTE_HISTOGRAM_DEBUG", "0") == "1"
@@ -72,9 +73,6 @@ class SoftmaxHistogramCollector:
             return True
         return _get_rank() == self.output_rank
 
-    def _should_collect_layer(self, layer_id: int) -> bool:
-        return (layer_id % self.layer_freq) == 0
-
     def _should_collect_now(self) -> bool:
         """Check if we should collect based on total forward calls."""
         return (self._total_fwd_calls % self.output_freq) == 0
@@ -87,9 +85,6 @@ class SoftmaxHistogramCollector:
             return
 
         if not self._should_collect_now():
-            return
-
-        if not self._should_collect_layer(layer_id):
             return
 
         # Debug: log first time we collect each layer
@@ -124,9 +119,6 @@ class SoftmaxHistogramCollector:
             return
 
         if not self._should_collect_now():
-            return
-
-        if not self._should_collect_layer(layer_id):
             return
 
         # Debug: log first time we collect each layer
