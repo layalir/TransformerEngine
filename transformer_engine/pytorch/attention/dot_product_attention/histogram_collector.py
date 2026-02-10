@@ -17,7 +17,7 @@ Environment variables:
 
 import os
 import threading
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 import torch
 
 
@@ -47,6 +47,13 @@ def _is_distributed() -> bool:
         return torch.distributed.is_initialized()
     except Exception:
         return False
+
+
+def _get_cuda_device() -> torch.device:
+    """Get CUDA device for current rank."""
+    if torch.cuda.is_available():
+        return torch.device(f"cuda:{torch.cuda.current_device()}")
+    return torch.device("cpu")
 
 
 class SoftmaxHistogramCollector:
@@ -88,6 +95,16 @@ class SoftmaxHistogramCollector:
         self._total_bwd_calls = 0
         self._last_output_at = 0
 
+        # Track which layers we've logged (for debug, only log once per layer)
+        self._logged_fwd_layers: Set[int] = set()
+        self._logged_bwd_layers: Set[int] = set()
+
+    def _debug_print(self, msg: str) -> None:
+        """Print debug message if debug mode is enabled."""
+        if self.debug:
+            rank = _get_rank()
+            print(f"[HISTO r{rank}] {msg}", flush=True)
+
     def _should_collect_layer(self, layer_id: int) -> bool:
         return (layer_id % self.layer_freq) == 0
 
@@ -111,6 +128,11 @@ class SoftmaxHistogramCollector:
 
         if not self._should_collect_layer(layer_id):
             return
+
+        # Debug: log first time we collect each layer
+        if self.debug and layer_id not in self._logged_fwd_layers:
+            self._logged_fwd_layers.add(layer_id)
+            self._debug_print(f"Collecting forward for layer {layer_id} (first time)")
 
         with torch.no_grad():
             flat_probs = probs.flatten()[::self.sample_stride].float()
@@ -141,6 +163,11 @@ class SoftmaxHistogramCollector:
 
         if not self._should_collect_layer(layer_id):
             return
+
+        # Debug: log first time we collect each layer
+        if self.debug and layer_id not in self._logged_bwd_layers:
+            self._logged_bwd_layers.add(layer_id)
+            self._debug_print(f"Collecting backward for layer {layer_id} (first time)")
 
         with torch.no_grad():
             flat_grad = grad.flatten()[::self.sample_stride].float()
@@ -190,36 +217,39 @@ class SoftmaxHistogramCollector:
 
         world_size = _get_world_size()
         rank = _get_rank()
+        device = _get_cuda_device()
+
+        self._debug_print(f"Gathering histograms from {world_size} ranks...")
 
         # Pack local forward histograms into a tensor
         # Format: [layer_id, hist_bin_0, hist_bin_1, ..., hist_bin_N-1] for each layer
         # Use -1 as layer_id to indicate empty slots
         local_fwd_data = torch.full(
-            (self.max_layers, 1 + self.num_bins), -1, dtype=torch.long
+            (self.max_layers, 1 + self.num_bins), -1, dtype=torch.long, device=device
         )
         with self.lock:
             for i, (layer_id, hist) in enumerate(self.forward_histograms.items()):
                 if i >= self.max_layers:
                     break
                 local_fwd_data[i, 0] = layer_id
-                local_fwd_data[i, 1:] = hist
+                local_fwd_data[i, 1:] = hist.to(device)
 
         # Pack local backward histograms similarly
         # Format: [layer_id, hist_bin_0, ..., hist_bin_N-1, min_val_bits, max_val_bits]
         local_bwd_data = torch.full(
-            (self.max_layers, 1 + self.num_bins + 2), -1, dtype=torch.long
+            (self.max_layers, 1 + self.num_bins + 2), -1, dtype=torch.long, device=device
         )
         with self.lock:
             for i, (layer_id, hist) in enumerate(self.backward_histograms.items()):
                 if i >= self.max_layers:
                     break
                 local_bwd_data[i, 0] = layer_id
-                local_bwd_data[i, 1:1+self.num_bins] = hist
+                local_bwd_data[i, 1:1+self.num_bins] = hist.to(device)
                 if layer_id in self.backward_ranges:
                     min_val, max_val = self.backward_ranges[layer_id]
-                    # Store floats as int bits
-                    local_bwd_data[i, -2] = torch.tensor(min_val).view(torch.long).item()
-                    local_bwd_data[i, -1] = torch.tensor(max_val).view(torch.long).item()
+                    # Store floats as int bits (use float64 for precision)
+                    local_bwd_data[i, -2] = torch.tensor(min_val, dtype=torch.float64).view(torch.long).item()
+                    local_bwd_data[i, -1] = torch.tensor(max_val, dtype=torch.float64).view(torch.long).item()
 
         # Gather all data to rank 0
         if rank == 0:
@@ -229,8 +259,13 @@ class SoftmaxHistogramCollector:
             gathered_fwd = None
             gathered_bwd = None
 
-        torch.distributed.gather(local_fwd_data, gathered_fwd, dst=0)
-        torch.distributed.gather(local_bwd_data, gathered_bwd, dst=0)
+        try:
+            torch.distributed.gather(local_fwd_data, gathered_fwd, dst=0)
+            torch.distributed.gather(local_bwd_data, gathered_bwd, dst=0)
+        except RuntimeError as e:
+            # If gather fails (e.g., backend issues), fall back to local data
+            self._debug_print(f"Gather failed: {e}, using local data only")
+            return self.forward_histograms.copy(), self.backward_histograms.copy()
 
         # Aggregate on rank 0
         aggregated_fwd: Dict[int, torch.Tensor] = {}
@@ -244,7 +279,7 @@ class SoftmaxHistogramCollector:
                     layer_id = row[0].item()
                     if layer_id < 0:
                         continue
-                    hist = row[1:]
+                    hist = row[1:].cpu()
                     if layer_id not in aggregated_fwd:
                         aggregated_fwd[layer_id] = torch.zeros(self.num_bins, dtype=torch.long)
                     aggregated_fwd[layer_id] += hist
@@ -255,7 +290,7 @@ class SoftmaxHistogramCollector:
                     layer_id = row[0].item()
                     if layer_id < 0:
                         continue
-                    hist = row[1:1+self.num_bins]
+                    hist = row[1:1+self.num_bins].cpu()
                     min_bits = row[-2].item()
                     max_bits = row[-1].item()
                     min_val = torch.tensor(min_bits, dtype=torch.long).view(torch.float64).item()
@@ -275,6 +310,9 @@ class SoftmaxHistogramCollector:
             # Store ranges for table generation
             self._aggregated_bwd_ranges = aggregated_bwd_ranges
 
+            self._debug_print(f"Aggregated data from {world_size} ranks: "
+                            f"{len(aggregated_fwd)} fwd layers, {len(aggregated_bwd)} bwd layers")
+
         return aggregated_fwd, aggregated_bwd
 
     def _do_output(self) -> None:
@@ -282,6 +320,8 @@ class SoftmaxHistogramCollector:
         current_rank = _get_rank()
 
         if self.gather_to_rank0 and _is_distributed():
+            self._debug_print("Output triggered (freq reached), starting gather...")
+
             # Gather from all ranks, only rank 0 prints
             fwd_histograms, bwd_histograms = self._gather_histograms_to_rank0()
 
@@ -289,12 +329,15 @@ class SoftmaxHistogramCollector:
                 table = self._get_table_from_data(fwd_histograms, bwd_histograms)
                 if table:
                     print(table, flush=True)
+                    self._debug_print("Output complete")
         else:
             # Local-only mode: each rank handles its own data
             if self._can_output():
+                self._debug_print("Output triggered (local mode)")
                 table = self.get_table()
                 if table:
                     print(table, flush=True)
+                    self._debug_print("Output complete")
 
         # Reset buffers to bound memory usage (default behavior)
         if self.reset_after_output:
@@ -327,9 +370,10 @@ class SoftmaxHistogramCollector:
         if not forward_histograms and not backward_histograms:
             return ""
 
+        world_size = _get_world_size()
         lines = []
         lines.append("=" * 80)
-        lines.append(f"SOFTMAX HISTOGRAM [AGGREGATED FROM ALL RANKS]")
+        lines.append(f"SOFTMAX HISTOGRAM [AGGREGATED FROM {world_size} RANKS]")
         lines.append(f"(fwd_calls={self._total_fwd_calls} bwd_calls={self._total_bwd_calls})")
         lines.append("=" * 80)
 
@@ -474,6 +518,8 @@ class SoftmaxHistogramCollector:
         self._total_fwd_calls = 0
         self._total_bwd_calls = 0
         self._last_output_at = 0
+        self._logged_fwd_layers.clear()
+        self._logged_bwd_layers.clear()
 
 
 # Global singleton
@@ -496,8 +542,9 @@ def get_histogram_collector() -> Optional[SoftmaxHistogramCollector]:
                 )
                 if _collector.debug:
                     rank = _get_rank()
-                    print(f"[HISTO] Initialized: rank={rank} bins={num_bins} freq={output_freq} "
-                          f"stride={_collector.sample_stride} output_rank={_collector.output_rank} "
-                          f"reset={_collector.reset_after_output} gather={_collector.gather_to_rank0}",
+                    world_size = _get_world_size()
+                    print(f"[HISTO r{rank}] Initialized: world_size={world_size} bins={num_bins} "
+                          f"freq={output_freq} stride={_collector.sample_stride} "
+                          f"gather={_collector.gather_to_rank0}",
                           flush=True)
     return _collector
