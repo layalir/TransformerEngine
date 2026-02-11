@@ -11,12 +11,18 @@ Environment variables:
 - NVTE_HISTOGRAM_OUTPUT_RANK: Which rank prints tables (default: -1 = all ranks print)
 - NVTE_HISTOGRAM_RESET_AFTER_OUTPUT: Clear buffers after output to bound memory (default: 1)
 
+Features:
+- Recompute detection: Automatically skips duplicate collections when activation
+  checkpointing/recompute causes forward pass to run twice (within 100ms threshold)
+- This prevents double-counting histograms when MoE/MLP recompute is enabled
+
 Note: Only layers using UnfusedDotProductAttention will have histograms collected.
 Use NVTE_FORCE_UNFUSED_LAYERS to control which layers are profiled.
 """
 
 import os
 import threading
+import time
 from typing import Dict, Optional, Set, Tuple
 import torch
 
@@ -67,6 +73,11 @@ class SoftmaxHistogramCollector:
         self._logged_fwd_layers: Set[int] = set()
         self._logged_bwd_layers: Set[int] = set()
 
+        # Recompute detection: track last collection time per layer
+        # If called twice within threshold, skip second call (it's recompute)
+        self._last_collection_time: Dict[int, float] = {}
+        self._recompute_threshold_ms = 100.0  # 100ms threshold for detecting recompute
+
     def _can_output(self) -> bool:
         """Check if this rank is allowed to output."""
         if self.output_rank == -1:
@@ -86,6 +97,23 @@ class SoftmaxHistogramCollector:
 
         if not self._should_collect_now():
             return
+
+        # Recompute detection: Skip if we collected this layer very recently
+        # This prevents double-counting when activation checkpointing recomputes forward
+        current_time = time.time()
+        last_time = self._last_collection_time.get(layer_id, 0)
+        time_since_last_ms = (current_time - last_time) * 1000.0
+
+        if time_since_last_ms < self._recompute_threshold_ms and last_time > 0:
+            # Skip this collection - it's likely a recomputed forward pass
+            if self.debug:
+                rank = _get_rank()
+                print(f"[HISTO r{rank}] Skipping recompute for layer {layer_id} "
+                      f"(called again after {time_since_last_ms:.1f}ms)", flush=True)
+            return
+
+        # Update last collection time for this layer
+        self._last_collection_time[layer_id] = current_time
 
         # Debug: log first time we collect each layer
         if self.debug and layer_id not in self._logged_fwd_layers:
@@ -258,6 +286,7 @@ class SoftmaxHistogramCollector:
         self._last_output_at = 0
         self._logged_fwd_layers.clear()
         self._logged_bwd_layers.clear()
+        self._last_collection_time.clear()
 
 
 # Global singleton
