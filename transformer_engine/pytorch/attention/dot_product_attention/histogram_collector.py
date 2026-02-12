@@ -8,7 +8,7 @@ Environment variables:
 - NVTE_HISTOGRAM_COLLECT_FORWARD: Enable forward collection (default: 1)
 - NVTE_HISTOGRAM_COLLECT_BACKWARD: Enable backward collection (default: 0)
 - NVTE_HISTOGRAM_DEBUG: Enable debug prints (default: 0)
-- NVTE_HISTOGRAM_OUTPUT_RANK: Which rank prints tables (default: -1 = all ranks print)
+- NVTE_HISTOGRAM_OUTPUT_RANK: Which rank(s) print tables (default: -1 = all ranks, or comma-separated list like "0,64,128,192")
 - NVTE_HISTOGRAM_RESET_AFTER_OUTPUT: Clear buffers after output to bound memory (default: 1)
 
 Features:
@@ -58,8 +58,13 @@ class SoftmaxHistogramCollector:
         self.collect_backward_enabled = os.getenv("NVTE_HISTOGRAM_COLLECT_BACKWARD", "0") == "1"
         self.debug = os.getenv("NVTE_HISTOGRAM_DEBUG", "0") == "1"
 
-        # Output control: -1 = all ranks print, otherwise only specified rank prints
-        self.output_rank = int(os.getenv("NVTE_HISTOGRAM_OUTPUT_RANK", "-1"))
+        # Output control: -1 = all ranks print, comma-separated list = specific ranks
+        output_rank_str = os.getenv("NVTE_HISTOGRAM_OUTPUT_RANK", "-1")
+        if output_rank_str == "-1":
+            self.output_ranks = None  # None means all ranks
+        else:
+            # Parse comma-separated list: "0,64,128,192" or single "0"
+            self.output_ranks = set(int(r.strip()) for r in output_rank_str.split(","))
 
         # Memory management: reset buffers after output to bound memory usage
         self.reset_after_output = os.getenv("NVTE_HISTOGRAM_RESET_AFTER_OUTPUT", "1") == "1"
@@ -80,9 +85,9 @@ class SoftmaxHistogramCollector:
 
     def _can_output(self) -> bool:
         """Check if this rank is allowed to output."""
-        if self.output_rank == -1:
-            return True
-        return _get_rank() == self.output_rank
+        if self.output_ranks is None:
+            return True  # All ranks can output
+        return _get_rank() in self.output_ranks
 
     def _should_collect_now(self) -> bool:
         """Check if we should collect based on total forward calls."""
@@ -309,7 +314,8 @@ def get_histogram_collector() -> Optional[SoftmaxHistogramCollector]:
                 )
                 if _collector.debug:
                     rank = _get_rank()
+                    output_ranks_str = "all" if _collector.output_ranks is None else str(sorted(_collector.output_ranks))
                     print(f"[HISTO r{rank}] Initialized: bins={num_bins} freq={output_freq} "
-                          f"stride={_collector.sample_stride} output_rank={_collector.output_rank}",
+                          f"stride={_collector.sample_stride} output_ranks={output_ranks_str}",
                           flush=True)
     return _collector
