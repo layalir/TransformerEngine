@@ -100,9 +100,6 @@ class SoftmaxHistogramCollector:
         if not self.collect_forward_enabled:
             return
 
-        if not self._should_collect_now():
-            return
-
         # Recompute detection: Skip if we collected this layer very recently
         # This prevents double-counting when activation checkpointing recomputes forward
         current_time = time.time()
@@ -151,9 +148,6 @@ class SoftmaxHistogramCollector:
         if not self.collect_backward_enabled:
             return
 
-        if not self._should_collect_now():
-            return
-
         # Debug: log first time we collect each layer
         if self.debug and layer_id not in self._logged_bwd_layers:
             self._logged_bwd_layers.add(layer_id)
@@ -189,6 +183,10 @@ class SoftmaxHistogramCollector:
 
     def _do_output(self) -> None:
         """Output histogram table and optionally reset buffers."""
+        # Only output at the specified frequency
+        if not self._should_collect_now():
+            return
+
         if self._can_output():
             table = self.get_table()
             if table:
