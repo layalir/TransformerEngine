@@ -4,7 +4,8 @@ Histogram collection for softmax analysis in attention mechanisms.
 Environment variables:
 - NVTE_HISTOGRAM_BINS: Number of histogram bins (default: 50)
 - NVTE_HISTOGRAM_OUTPUT_FREQ: Output every N forward calls on THIS rank (default: 1000)
-- NVTE_HISTOGRAM_SAMPLE_STRIDE: Sample every Nth element (default: 10000)
+- NVTE_HISTOGRAM_SAMPLE_STRIDE: Sample every Nth element (default: 10000), or if NVTE_HISTOGRAM_USE_MAXPOOL=1, this is the pool size
+- NVTE_HISTOGRAM_USE_MAXPOOL: Use max pooling instead of strided sampling (default: 0, adds ~1-2% overhead)
 - NVTE_HISTOGRAM_COLLECT_FORWARD: Enable forward collection (default: 1)
 - NVTE_HISTOGRAM_COLLECT_BACKWARD: Enable backward collection (default: 0)
 - NVTE_HISTOGRAM_DEBUG: Enable debug prints (default: 0)
@@ -54,6 +55,7 @@ class SoftmaxHistogramCollector:
 
         # Performance tuning
         self.sample_stride = int(os.getenv("NVTE_HISTOGRAM_SAMPLE_STRIDE", "10000"))
+        self.use_maxpool = os.getenv("NVTE_HISTOGRAM_USE_MAXPOOL", "0") == "1"
         self.collect_forward_enabled = os.getenv("NVTE_HISTOGRAM_COLLECT_FORWARD", "1") == "1"
         self.collect_backward_enabled = os.getenv("NVTE_HISTOGRAM_COLLECT_BACKWARD", "0") == "1"
         self.debug = os.getenv("NVTE_HISTOGRAM_DEBUG", "0") == "1"
@@ -125,9 +127,29 @@ class SoftmaxHistogramCollector:
 
         with torch.no_grad():
             # Sample and compute histogram on GPU, then move to CPU
-            flat_probs = probs.flatten()[::self.sample_stride].float()
-            hist = torch.histc(flat_probs, bins=self.num_bins, min=0.0, max=1.0)
-            del flat_probs
+            if self.use_maxpool:
+                # Max pooling: find max of each pool_size chunk
+                flat = probs.flatten().float()
+                n_elements = flat.shape[0]
+                pool_size = self.sample_stride  # Reuse stride variable as pool size
+                n_pools = n_elements // pool_size
+
+                if n_pools > 0:
+                    # Truncate to multiple of pool_size and reshape
+                    flat_truncated = flat[:n_pools * pool_size]
+                    pooled = flat_truncated.view(n_pools, pool_size)
+                    # Max along pool dimension
+                    sampled_values = pooled.max(dim=1).values
+                else:
+                    # Fallback if tensor too small
+                    sampled_values = flat
+                del flat
+            else:
+                # Strided sampling (original approach)
+                sampled_values = probs.flatten()[::self.sample_stride].float()
+
+            hist = torch.histc(sampled_values, bins=self.num_bins, min=0.0, max=1.0)
+            del sampled_values
 
             with self.lock:
                 if layer_id not in self.forward_histograms:
@@ -313,7 +335,8 @@ def get_histogram_collector() -> Optional[SoftmaxHistogramCollector]:
                 if _collector.debug:
                     rank = _get_rank()
                     output_ranks_str = "all" if _collector.output_ranks is None else str(sorted(_collector.output_ranks))
+                    sampling_mode = f"maxpool={_collector.sample_stride}" if _collector.use_maxpool else f"stride={_collector.sample_stride}"
                     print(f"[HISTO r{rank}] Initialized: bins={num_bins} freq={output_freq} "
-                          f"stride={_collector.sample_stride} output_ranks={output_ranks_str}",
+                          f"{sampling_mode} output_ranks={output_ranks_str}",
                           flush=True)
     return _collector
