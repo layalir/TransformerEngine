@@ -3,6 +3,7 @@ Histogram collection for softmax analysis in attention mechanisms.
 
 Environment variables:
 - NVTE_HISTOGRAM_BINS: Number of histogram bins (default: 50)
+- NVTE_HISTOGRAM_DISPLAY_BINS: Number of bins to display in table (default: 10, shows top N bins by count)
 - NVTE_HISTOGRAM_OUTPUT_FREQ: Output every N forward calls on THIS rank (default: 1000)
 - NVTE_HISTOGRAM_SAMPLE_STRIDE: Sample every Nth element (default: 10000), or if NVTE_HISTOGRAM_USE_MAXPOOL=1, this is the pool size
 - NVTE_HISTOGRAM_USE_MAXPOOL: Use max pooling instead of strided sampling (default: 0, adds ~1-2% overhead)
@@ -44,6 +45,7 @@ class SoftmaxHistogramCollector:
     def __init__(self, num_bins: int = 50, output_freq: int = 1000):
         self.num_bins = num_bins
         self.output_freq = output_freq
+        self.display_bins = int(os.getenv("NVTE_HISTOGRAM_DISPLAY_BINS", "10"))
 
         # Histogram storage (CPU tensors for memory efficiency)
         self.forward_histograms: Dict[int, torch.Tensor] = {}
@@ -258,7 +260,7 @@ class SoftmaxHistogramCollector:
                     lines.append(f"  {'Bin Start':<12} | {'Bin End':<12} | {'Count':<15} | {'Percentage':<10}")
                     lines.append("  " + "-" * 60)
 
-                    top_indices = torch.topk(hist, min(10, self.num_bins)).indices
+                    top_indices = torch.topk(hist, min(self.display_bins, self.num_bins)).indices
                     for idx in top_indices:
                         idx = idx.item()
                         bin_start = edges[idx].item()
@@ -288,7 +290,7 @@ class SoftmaxHistogramCollector:
                     lines.append(f"  {'Bin Start':<12} | {'Bin End':<12} | {'Count':<15} | {'Percentage':<10}")
                     lines.append("  " + "-" * 60)
 
-                    top_indices = torch.topk(hist, min(10, self.num_bins)).indices
+                    top_indices = torch.topk(hist, min(self.display_bins, self.num_bins)).indices
                     for idx in top_indices:
                         idx = idx.item()
                         bin_start = edges[idx].item()
