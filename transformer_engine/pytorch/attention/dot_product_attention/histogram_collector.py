@@ -5,8 +5,8 @@ Environment variables:
 - NVTE_HISTOGRAM_BINS: Number of histogram bins (default: 50)
 - NVTE_HISTOGRAM_DISPLAY_BINS: Number of bins to display in table (default: 10, shows top N bins by count)
 - NVTE_HISTOGRAM_OUTPUT_FREQ: Output every N forward calls on THIS rank (default: 1000)
-- NVTE_HISTOGRAM_SAMPLE_STRIDE: Sample every Nth element (default: 10000), or if NVTE_HISTOGRAM_USE_MAXPOOL=1, this is the pool size
-- NVTE_HISTOGRAM_USE_MAXPOOL: Use max pooling instead of strided sampling (default: 0, adds ~1-2% overhead)
+- NVTE_HISTOGRAM_SAMPLE_STRIDE: Sample every Nth element (default: 10000), ignored when maxpool is enabled
+- NVTE_HISTOGRAM_USE_MAXPOOL: Use 2D tile-aware max pooling (128×128 tiles) to match softmax kernel processing (default: 0, adds ~1-2% overhead)
 - NVTE_HISTOGRAM_COLLECT_FORWARD: Enable forward collection (default: 1)
 - NVTE_HISTOGRAM_COLLECT_BACKWARD: Enable backward collection (default: 0)
 - NVTE_HISTOGRAM_DEBUG: Enable debug prints (default: 0)
@@ -130,22 +130,55 @@ class SoftmaxHistogramCollector:
         with torch.no_grad():
             # Sample and compute histogram on GPU, then move to CPU
             if self.use_maxpool:
-                # Max pooling: find max of each pool_size chunk
-                flat = probs.flatten().float()
-                n_elements = flat.shape[0]
-                pool_size = self.sample_stride  # Reuse stride variable as pool size
-                n_pools = n_elements // pool_size
+                # 2D Tile-aware max pooling: matches softmax kernel tile processing
+                # Attention probs shape: [batch, heads, seq_q, seq_k]
+                tile_size = 128  # Standard softmax tile size
 
-                if n_pools > 0:
-                    # Truncate to multiple of pool_size and reshape
-                    flat_truncated = flat[:n_pools * pool_size]
-                    pooled = flat_truncated.view(n_pools, pool_size)
-                    # Max along pool dimension
-                    sampled_values = pooled.max(dim=1).values
+                probs_float = probs.float()
+                shape = probs_float.shape
+
+                # For attention: [batch, heads, seq_q, seq_k]
+                if len(shape) == 4:
+                    batch, heads, seq_q, seq_k = shape
+
+                    # Calculate number of tiles
+                    tiles_q = seq_q // tile_size
+                    tiles_k = seq_k // tile_size
+
+                    if tiles_q > 0 and tiles_k > 0:
+                        # Truncate to multiples of tile_size
+                        truncated_q = tiles_q * tile_size
+                        truncated_k = tiles_k * tile_size
+                        probs_truncated = probs_float[:, :, :truncated_q, :truncated_k]
+
+                        # Reshape to expose tile structure
+                        # [batch, heads, seq_q, seq_k] -> [batch, heads, tiles_q, tile_size, tiles_k, tile_size]
+                        probs_tiled = probs_truncated.view(
+                            batch, heads, tiles_q, tile_size, tiles_k, tile_size
+                        )
+
+                        # Max over each 128x128 tile (last two dimensions)
+                        # Result: [batch, heads, tiles_q, tiles_k]
+                        tile_maxes = probs_tiled.max(dim=-1).values.max(dim=-2).values
+
+                        # Flatten to get all tile max values
+                        sampled_values = tile_maxes.flatten()
+                    else:
+                        # Fallback: tiles too small, use regular max pooling
+                        sampled_values = probs_float.flatten()
                 else:
-                    # Fallback if tensor too small
-                    sampled_values = flat
-                del flat
+                    # Unexpected shape, fallback to 1D pooling
+                    flat = probs_float.flatten()
+                    pool_size = self.sample_stride
+                    n_pools = flat.shape[0] // pool_size
+                    if n_pools > 0:
+                        flat_truncated = flat[:n_pools * pool_size]
+                        pooled = flat_truncated.view(n_pools, pool_size)
+                        sampled_values = pooled.max(dim=1).values
+                    else:
+                        sampled_values = flat
+
+                del probs_float
             else:
                 # Strided sampling (original approach)
                 sampled_values = probs.flatten()[::self.sample_stride].float()
