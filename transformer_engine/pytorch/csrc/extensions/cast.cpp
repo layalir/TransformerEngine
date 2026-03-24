@@ -232,6 +232,138 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
   return py::reinterpret_borrow<py::object>(grouped_output_py);
 }
 
+/*! \brief Fused layout-permute + MXFP8 quantize for attention QKV.
+ *
+ * Takes a contiguous SBHD (or similar non-BHSD) tensor as input and produces
+ * contiguous BHSD-ordered MXFP8 data with correct scales.  Each head is treated
+ * as a separate sub-tensor read via TMA with a custom row stride, avoiding the
+ * BF16 permute+contiguous copy.
+ *
+ * Returns: tuple(rowwise_data, columnwise_data, scale_inv, columnwise_scale_inv)
+ *          Any unused component is None.
+ */
+py::tuple group_quantize_strided(
+    const at::Tensor &input,          // SBHD contiguous BF16/FP16 tensor
+    py::handle quantizer,             // MXFP8Quantizer Python object
+    const at::Tensor &input_byte_offsets,  // int64 CUDA tensor [num_tensors+1]
+    int64_t input_stride_elems,       // row stride in elements
+    int64_t rows,                     // seqlen S
+    int64_t cols,                     // head dim D
+    int64_t num_tensors               // B*H (number of heads)
+) {
+  using namespace transformer_engine::pytorch::detail;
+  init_extension();
+
+  NVTE_CHECK(detail::IsMXFP8Quantizers(quantizer.ptr()),
+             "group_quantize_strided: only MXFP8 quantizer is supported.");
+
+  auto quantizer_cpp = convert_quantizer(quantizer);
+  auto *mxfp8_q = static_cast<MXFP8Quantizer *>(quantizer_cpp.get());
+
+  const DType fp8_dtype = mxfp8_q->dtype;
+  const bool use_rowwise = mxfp8_q->rowwise_usage;
+  const bool use_colwise = mxfp8_q->columnwise_usage;
+  const bool optimize_for_gemm = mxfp8_q->optimize_for_gemm;
+
+  NVTE_CHECK(use_rowwise || use_colwise,
+             "At least one of rowwise/columnwise must be enabled.");
+
+  const size_t total_elements =
+      static_cast<size_t>(num_tensors) * static_cast<size_t>(rows) * static_cast<size_t>(cols);
+
+  // The "logical shape" for VARYING_BOTH_DIMS is [1, total_elements].
+  const std::vector<size_t> logical_shape = {1, total_elements};
+  const size_t num_t = static_cast<size_t>(num_tensors);
+  const size_t r = static_cast<size_t>(rows);
+  const size_t c = static_cast<size_t>(cols);
+
+  // Per-tensor shape: [rows, cols] — same for all tensors.
+  // Scale shapes are computed per-tensor and concatenated.
+  const std::vector<size_t> per_tensor_shape = {r, c};
+  const auto rowwise_scale_shape = mxfp8_q->get_scale_shape(per_tensor_shape, false);
+  const auto colwise_scale_shape = mxfp8_q->get_scale_shape(per_tensor_shape, true);
+
+  const auto uint8_opts = at::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
+
+  // Allocate output buffers.
+  at::Tensor rowwise_data, columnwise_data, rowwise_scale_inv, columnwise_scale_inv;
+
+  if (use_rowwise) {
+    rowwise_data = at::empty({static_cast<int64_t>(total_elements)}, uint8_opts);
+    const int64_t total_scale = static_cast<int64_t>(product(rowwise_scale_shape)) *
+                                static_cast<int64_t>(num_t);
+    rowwise_scale_inv = at::empty({total_scale}, uint8_opts);
+  }
+  if (use_colwise) {
+    columnwise_data = at::empty({static_cast<int64_t>(total_elements)}, uint8_opts);
+    const int64_t total_scale = static_cast<int64_t>(product(colwise_scale_shape)) *
+                                static_cast<int64_t>(num_t);
+    columnwise_scale_inv = at::empty({total_scale}, uint8_opts);
+  }
+
+  // Build metadata tensors on GPU.
+  // first_dims: [rows, rows, ..., rows]  (num_tensors entries)
+  // last_dims:  [cols, cols, ..., cols]
+  // tensor_offsets: [0, rows*cols, 2*rows*cols, ..., num_tensors*rows*cols]
+  auto int64_opts = at::TensorOptions().dtype(torch::kInt64).device(torch::kCUDA);
+  at::Tensor first_dims_t = at::full({num_tensors}, rows, int64_opts);
+  at::Tensor last_dims_t = at::full({num_tensors}, cols, int64_opts);
+
+  // Tensor offsets: num_tensors+1 entries (inclusive of sentinel at end)
+  at::Tensor tensor_offsets_t = at::arange(0, (num_tensors + 1) * rows * cols,
+                                           rows * cols, int64_opts);
+
+  // Build GroupedTensorWrapper for the output.
+  GroupedTensorWrapper out_cpp(num_t, logical_shape, mxfp8_q->get_scaling_mode());
+
+  if (use_rowwise) {
+    out_cpp.set_rowwise_data(rowwise_data.data_ptr(), fp8_dtype,
+                             getTensorShape(rowwise_data));
+    out_cpp.set_rowwise_scale_inv(rowwise_scale_inv.data_ptr(), DType::kFloat8E8M0,
+                                  getTensorShape(rowwise_scale_inv));
+  }
+  if (use_colwise) {
+    out_cpp.set_columnwise_data(columnwise_data.data_ptr(), fp8_dtype,
+                                getTensorShape(columnwise_data));
+    out_cpp.set_columnwise_scale_inv(columnwise_scale_inv.data_ptr(), DType::kFloat8E8M0,
+                                     getTensorShape(columnwise_scale_inv));
+  }
+  out_cpp.set_first_dims(first_dims_t.data_ptr(), DType::kInt64,
+                          getTensorShape(first_dims_t));
+  out_cpp.set_last_dims(last_dims_t.data_ptr(), DType::kInt64,
+                         getTensorShape(last_dims_t));
+  out_cpp.set_tensor_offsets(tensor_offsets_t.data_ptr(), DType::kInt64,
+                              getTensorShape(tensor_offsets_t));
+  out_cpp.set_with_gemm_swizzled_scales(optimize_for_gemm);
+
+  // Build the input_byte_offsets TensorWrapper.
+  auto offsets_tw = makeTransformerEngineTensor(
+      input_byte_offsets.data_ptr(),
+      getTensorShape(input_byte_offsets),
+      DType::kInt64);
+
+  // Call the C API.
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_group_quantize_strided(
+        out_cpp.data(),
+        static_cast<NVTEDType>(GetTransformerEngineDType(input.scalar_type())),
+        input.data_ptr(),
+        offsets_tw.data(),
+        static_cast<size_t>(input_stride_elems),
+        r,
+        c,
+        at::cuda::getCurrentCUDAStream());
+  });
+
+  // Return tuple of tensors.
+  return py::make_tuple(
+      use_rowwise ? py::cast(rowwise_data) : py::none(),
+      use_colwise ? py::cast(columnwise_data) : py::none(),
+      use_rowwise ? py::cast(rowwise_scale_inv) : py::none(),
+      use_colwise ? py::cast(columnwise_scale_inv) : py::none()
+  );
+}
+
 py::object dequantize(const py::handle &input, transformer_engine::DType otype) {
   init_extension();
 

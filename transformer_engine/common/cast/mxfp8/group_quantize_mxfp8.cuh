@@ -30,7 +30,7 @@ namespace group_quantize_kernel {
 
 using namespace dispatch::common;
 
-constexpr int MAX_SUPPORTED_TENSOR_DESCRIPTORS = 64;
+constexpr int MAX_SUPPORTED_TENSOR_DESCRIPTORS = 256;
 __device__ alignas(128) CUtensorMap g_tensor_maps_input[MAX_SUPPORTED_TENSOR_DESCRIPTORS];
 __device__ alignas(128) CUtensorMap g_tensor_maps_act_input[MAX_SUPPORTED_TENSOR_DESCRIPTORS];
 __device__ alignas(128) CUtensorMap g_tensor_maps_output_rowwise[MAX_SUPPORTED_TENSOR_DESCRIPTORS];
@@ -129,18 +129,21 @@ __device__ __forceinline__ size_t get_tensor_cols_num(
   return cols_num;
 }
 
-// Copies the base tensor map to shmem, modifies the copy, stores the modified tensor map at index
+// Copies the base tensor map to shmem, modifies the copy, stores the modified tensor map at index.
+// stride_elems overrides global_dim_X for the TMA row stride when the input is non-contiguous
+// (e.g. reading heads from an SBHD tensor where the row stride is B*H*D, not D).
 __device__ __forceinline__ void modify_base_tensor_map(const CUtensorMap base_tensor_map,
                                                        CUtensorMap *global_tensor_map,
                                                        const uintptr_t global_data_ptr,
                                                        const size_t global_dim_Y,
                                                        const size_t global_dim_X,
-                                                       const size_t data_type_size_bytes) {
+                                                       const size_t data_type_size_bytes,
+                                                       const size_t stride_elems) {
   __shared__ CUtensorMap shared_tensor_map;
   shared_tensor_map = base_tensor_map;  // Copy the base tensor map into shmem
   constexpr bool is_blackwell = ARCH_BLACKWELL_FAMILY;
   if constexpr (is_blackwell) {
-    const size_t global_stride_bytes = global_dim_X * data_type_size_bytes;
+    const size_t global_stride_bytes = stride_elems * data_type_size_bytes;
     if (global_stride_bytes % TMA_GMEM_ALIGNMENT != 0) {
       NVTE_DEVICE_ERROR("Shape not supported. Data stride must be 16B aligned.");
     }
@@ -166,6 +169,17 @@ __device__ __forceinline__ void modify_base_tensor_map(const CUtensorMap base_te
         "tensormap.replace is architecture-specific. "
         "Try recompiling with sm_XXXa instead of sm_XXX.");
   }
+}
+
+// Backward-compatible overload: stride_elems defaults to global_dim_X (contiguous).
+__device__ __forceinline__ void modify_base_tensor_map(const CUtensorMap base_tensor_map,
+                                                       CUtensorMap *global_tensor_map,
+                                                       const uintptr_t global_data_ptr,
+                                                       const size_t global_dim_Y,
+                                                       const size_t global_dim_X,
+                                                       const size_t data_type_size_bytes) {
+  modify_base_tensor_map(base_tensor_map, global_tensor_map, global_data_ptr, global_dim_Y,
+                         global_dim_X, data_type_size_bytes, global_dim_X);
 }
 
 template <typename IType, typename OType>
@@ -213,6 +227,53 @@ __global__ void update_tma_descriptors(
     if (colwise) {
       const uintptr_t global_data_ptr =
           reinterpret_cast<uintptr_t>(output_colwise_data_ptr + offset_elts);
+      modify_base_tensor_map(base_tensor_map_output_colwise,
+                             &g_tensor_maps_output_colwise[tensor_id], global_data_ptr, rows, cols,
+                             sizeof(OType));
+    }
+  }
+}
+
+// Variant of update_tma_descriptors that supports separate input/output offsets
+// and a custom input row stride (for reading from non-contiguous permuted tensors).
+// - input_byte_offsets_ptr:     per-tensor byte offset from input_data_ptr
+// - output_element_offsets_ptr: per-tensor element offset from output data ptrs
+// - input_stride_elems:         row stride for the input TMA (may differ from cols)
+template <typename IType, typename OType>
+__global__ void update_tma_descriptors_strided(
+    const __grid_constant__ CUtensorMap base_tensor_map_input,
+    const __grid_constant__ CUtensorMap base_tensor_map_output_rowwise,
+    const __grid_constant__ CUtensorMap base_tensor_map_output_colwise,
+    const IType *const __restrict__ input_data_ptr,
+    const OType *const __restrict__ output_rowwise_data_ptr,
+    const OType *const __restrict__ output_colwise_data_ptr,
+    const size_t num_tensors, const size_t rows, const size_t cols,
+    const int64_t *const __restrict__ input_byte_offsets_ptr,
+    const int64_t *const __restrict__ output_element_offsets_ptr,
+    const size_t input_stride_elems, const bool rowwise, const bool colwise) {
+  const bool leading_thread = (threadIdx.x == 0);
+  const size_t tensor_id = blockIdx.x;
+
+  if (leading_thread && (tensor_id < num_tensors)) {
+    {
+      const uintptr_t global_data_ptr =
+          reinterpret_cast<uintptr_t>(input_data_ptr) +
+          static_cast<size_t>(input_byte_offsets_ptr[tensor_id]);
+      modify_base_tensor_map(base_tensor_map_input, &g_tensor_maps_input[tensor_id],
+                             global_data_ptr, rows, cols, sizeof(IType), input_stride_elems);
+    }
+    const size_t output_byte_offset =
+        static_cast<size_t>(output_element_offsets_ptr[tensor_id]) * sizeof(OType);
+    if (rowwise) {
+      const uintptr_t global_data_ptr =
+          reinterpret_cast<uintptr_t>(output_rowwise_data_ptr) + output_byte_offset;
+      modify_base_tensor_map(base_tensor_map_output_rowwise,
+                             &g_tensor_maps_output_rowwise[tensor_id], global_data_ptr, rows, cols,
+                             sizeof(OType));
+    }
+    if (colwise) {
+      const uintptr_t global_data_ptr =
+          reinterpret_cast<uintptr_t>(output_colwise_data_ptr) + output_byte_offset;
       modify_base_tensor_map(base_tensor_map_output_colwise,
                              &g_tensor_maps_output_colwise[tensor_id], global_data_ptr, rows, cols,
                              sizeof(OType));
@@ -290,16 +351,28 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK) group_quantize_mxfp8_kernel
   if (rows == 0 || cols == 0) {
     return;
   }
+  // Compute the 2D block position within the current tensor early so the
+  // bounds check can use it.  This is needed when offsets are "padded" (e.g.,
+  // the strided-quantize path uses padded element offsets to ensure correct
+  // grid mapping when cols is not a multiple of CHUNK_DIM_X).
+  const size_t blocks_X_num_in_current_tensor = DIVUP(cols, static_cast<size_t>(128));
+  const size_t block_id_in_current_tensor =
+      is_single_tensor ? block_ID : (block_ID - tensor_base / ELTS_PER_CHUNK);
+
+  const size_t block_id_Y = block_id_in_current_tensor / blocks_X_num_in_current_tensor;
+  const size_t block_id_X = block_id_in_current_tensor % blocks_X_num_in_current_tensor;
+
+  const size_t block_offset_Y = block_id_Y * CHUNK_DIM_Y;
+  const size_t block_offset_X = block_id_X * CHUNK_DIM_X;
+
   if (shape_rep != SAME_BOTH_DIMS) {
-    const size_t tensor_start_offset = static_cast<size_t>(offsets_ptr[tensor_id]);
     const size_t tensor_end_offset = static_cast<size_t>(offsets_ptr[tensor_id + 1]);
     if (block_global_offset >= tensor_end_offset) {
       return;
     }
-    const size_t tensor_offset_from_start = block_global_offset - tensor_start_offset;
-    const size_t block_offset_Y_in_tensor = tensor_offset_from_start / cols;
-    const size_t block_offset_X_in_tensor = tensor_offset_from_start % cols;
-    if (block_offset_Y_in_tensor >= rows || block_offset_X_in_tensor >= cols) {
+    // Use the 2D block position for the bounds check (not a linear-to-2D
+    // conversion via cols).  This is correct for both regular and padded offsets.
+    if (block_offset_Y >= rows) {
       return;
     }
   }
@@ -327,16 +400,6 @@ __global__ void __launch_bounds__(THREADS_PER_CHUNK) group_quantize_mxfp8_kernel
       fence_acquire_tensormap(&tensor_map_output_colwise);
     }
   }
-
-  const size_t blocks_X_num_in_current_tensor = DIVUP(cols, static_cast<size_t>(128));
-  const size_t block_id_in_current_tensor =
-      is_single_tensor ? block_ID : (block_ID - tensor_base / ELTS_PER_CHUNK);
-
-  const size_t block_id_Y = block_id_in_current_tensor / blocks_X_num_in_current_tensor;
-  const size_t block_id_X = block_id_in_current_tensor % blocks_X_num_in_current_tensor;
-
-  const size_t block_offset_Y = block_id_Y * CHUNK_DIM_Y;
-  const size_t block_offset_X = block_id_X * CHUNK_DIM_X;
 
   e8m0_t *const scales_rowwise =
       scales_rowwise_ptr + (is_single_tensor ? 0 : tensor_base / SCALE_DIM_X);
@@ -841,7 +904,8 @@ void group_quantize(const GroupedTensor *input, const GroupedTensor *activations
   } else {
     NVTE_CHECK(num_tensors <= MAX_SUPPORTED_TENSOR_DESCRIPTORS,
                "Number of tensors in a group is larger than "
-               "the MAX number of supported descriptors (64).");
+               "the MAX number of supported descriptors (",
+               MAX_SUPPORTED_TENSOR_DESCRIPTORS, ").");
     blocks_Y = 1;
     blocks_X = DIVUP(elts_total, CHUNK_DIM_Y * CHUNK_DIM_X);
   }
@@ -1012,6 +1076,269 @@ void group_quantize(const GroupedTensor *input, const GroupedTensor *activations
               NVTE_CHECK_CUDA(cudaGetLastError()););  // NOLINT(*)
       );                                              // NOLINT(*)
   );                                                  // NOLINT(*)
+}
+
+// Fill an array with [0, step, 2*step, ..., n*step].
+__global__ void fill_strided_offsets(int64_t *out, size_t n_plus_one, int64_t step) {
+  const size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n_plus_one) {
+    out[idx] = static_cast<int64_t>(idx) * step;
+  }
+}
+
+/*! \brief Quantize a non-contiguous (strided) input into a contiguous grouped output.
+ *
+ * This is a variant of group_quantize designed for fused layout permutation + quantization.
+ * The input tensor is accessed via per-tensor TMA descriptors with a custom row stride
+ * (e.g., reading individual heads from an SBHD tensor), while the output is written
+ * contiguously in BHSD order.
+ *
+ * Constraints:
+ *   - All sub-tensors must have the same shape (rows, cols)
+ *   - rows must be divisible by 128
+ *   - No activation/dbias support (attention QKV path only)
+ *   - num_tensors <= MAX_SUPPORTED_TENSOR_DESCRIPTORS
+ *
+ * \param[in]  output              Grouped output tensor (contiguous, FP8). Must have
+ *                                 tensor_offsets, first_dims, last_dims set for VARYING_BOTH_DIMS.
+ * \param[in]  input_dtype         DType of the input data (e.g., kBFloat16)
+ * \param[in]  input_data_ptr      Base pointer to the input data
+ * \param[in]  input_byte_offsets  Device int64_t[num_tensors+1]: byte offset from input_data_ptr
+ *                                 to the start of each sub-tensor (last entry is sentinel)
+ * \param[in]  input_stride_elems  Row stride in elements for the input (same for all sub-tensors)
+ * \param[in]  rows                Number of rows per sub-tensor (e.g., seqlen S)
+ * \param[in]  cols                Number of columns per sub-tensor (e.g., head dim D)
+ * \param[in]  stream              CUDA stream
+ */
+void group_quantize_strided(GroupedTensor *output,
+                            const DType input_dtype,
+                            const void *input_data_ptr,
+                            const SimpleTensor &input_byte_offsets,
+                            const size_t input_stride_elems,
+                            const size_t rows,
+                            const size_t cols,
+                            cudaStream_t stream) {
+  using namespace group_quantize_kernel;
+
+  checkCuDriverContext(stream);
+
+  const bool use_rowwise_scaling = output->has_data();
+  const bool use_colwise_scaling = output->has_columnwise_data();
+  NVTE_CHECK(use_rowwise_scaling || use_colwise_scaling,
+             "Either rowwise or columnwise output data need to be allocated.");
+  NVTE_CHECK(is_fp8_dtype(output->dtype()), "Output must have FP8 type.");
+
+  const size_t num_tensors = output->num_tensors;
+  NVTE_CHECK(num_tensors <= MAX_SUPPORTED_TENSOR_DESCRIPTORS,
+             "Number of tensors in a group is larger than "
+             "the MAX number of supported descriptors (",
+             MAX_SUPPORTED_TENSOR_DESCRIPTORS, ").");
+  NVTE_CHECK(num_tensors > 0, "Number of tensors must be > 0.");
+  NVTE_CHECK(rows % 128 == 0,
+             "Row dimension must be divisible by 128, got ", rows, ".");
+  NVTE_CHECK(input_byte_offsets.has_data(),
+             "input_byte_offsets must be provided.");
+
+  ScalingType scaling_type = ScalingType::BIDIMENSIONAL;
+  if (!use_colwise_scaling) {
+    scaling_type = ScalingType::ROWWISE;
+  } else if (!use_rowwise_scaling) {
+    scaling_type = ScalingType::COLWISE;
+  }
+
+  const bool with_gemm_swizzled_scales = output->with_gemm_swizzled_scales;
+
+  // Strided path always uses per-tensor TMA descriptors (not single-tensor).
+  // We use VARYING_BOTH_DIMS shape representation so the kernel takes the
+  // per-tensor code path (is_single_tensor = false).
+  constexpr ShapeRepresentation shape_rep = ShapeRepresentation::VARYING_BOTH_DIMS;
+
+  const size_t elts_per_tensor = rows * cols;
+
+  // When cols is not a multiple of CHUNK_DIM_X (128), the linear grid
+  // DIVUP(elts_total, ELTS_PER_CHUNK) undercounts blocks because the 2D
+  // decomposition inside the kernel wastes partial chunks in the X dimension.
+  // Fix: compute blocks per tensor using the 2D formula, and use "padded"
+  // element offsets (blocks_per_tensor * ELTS_PER_CHUNK) so that
+  // tensor_base / ELTS_PER_CHUNK gives the correct block-aligned start.
+  // This also ensures tensor_base / SCALE_DIM gives correct scale offsets
+  // (proven: ceil_128(cols)/32 == ceil_4(cols/32) when cols % 32 == 0).
+  const size_t blocks_per_tensor_Y = DIVUP(rows, CHUNK_DIM_Y);
+  const size_t blocks_per_tensor_X = DIVUP(cols, CHUNK_DIM_X);
+  const size_t blocks_per_tensor = blocks_per_tensor_Y * blocks_per_tensor_X;
+  const size_t padded_elts_per_tensor = blocks_per_tensor * CHUNK_DIM_Y * CHUNK_DIM_X;
+  const size_t padded_elts_total = num_tensors * padded_elts_per_tensor;
+
+  const size_t total_blocks = num_tensors * blocks_per_tensor;
+  const dim3 grid(total_blocks, 1);
+  const size_t block_size = THREADS_PER_CHUNK;
+
+  // Actual output element offsets (for TMA descriptor base addresses).
+  const int64_t *const actual_offsets_ptr =
+      reinterpret_cast<const int64_t *>(output->tensor_offsets.dptr);
+  const int64_t *const first_dims_ptr =
+      reinterpret_cast<const int64_t *>(output->first_dims.dptr);
+  const int64_t *const last_dims_ptr =
+      reinterpret_cast<const int64_t *>(output->last_dims.dptr);
+
+  NVTE_CHECK(actual_offsets_ptr != nullptr, "tensor_offsets must be set on output.");
+  NVTE_CHECK(first_dims_ptr != nullptr, "first_dims must be set on output.");
+  NVTE_CHECK(last_dims_ptr != nullptr, "last_dims must be set on output.");
+
+  // Allocate padded offsets on device for the kernel's grid mapping and scale indexing.
+  // Padded offsets: [0, padded_elts, 2*padded_elts, ..., num_tensors*padded_elts]
+  int64_t *padded_offsets_ptr = nullptr;
+  NVTE_CHECK_CUDA(cudaMallocAsync(&padded_offsets_ptr,
+                                   (num_tensors + 1) * sizeof(int64_t), stream));
+  {
+    const size_t n_plus_one = num_tensors + 1;
+    fill_strided_offsets<<<DIVUP(n_plus_one, 128), 128, 0, stream>>>(
+        padded_offsets_ptr, n_plus_one, static_cast<int64_t>(padded_elts_per_tensor));
+  }
+
+  float *const amax_ptr = reinterpret_cast<float *>(output->amax.dptr);
+  e8m0_t *const scales_rowwise_ptr = reinterpret_cast<e8m0_t *>(output->scale_inv.dptr);
+  e8m0_t *const scales_colwise_ptr = reinterpret_cast<e8m0_t *>(output->columnwise_scale_inv.dptr);
+
+  if (use_rowwise_scaling) {
+    NVTE_CHECK(scales_rowwise_ptr != nullptr, "Scaling tensor must be allocated");
+  }
+  if (use_colwise_scaling) {
+    NVTE_CHECK(scales_colwise_ptr != nullptr, "Columnwise scaling tensor must be allocated");
+  }
+
+  const int64_t *const input_byte_offsets_ptr =
+      reinterpret_cast<const int64_t *>(input_byte_offsets.dptr);
+
+  TRANSFORMER_ENGINE_TYPE_SWITCH_NON_FP8ONLY(
+      input_dtype, IType,
+      TRANSFORMER_ENGINE_TYPE_SWITCH_FP8ONLY(
+          output->dtype(), OType,
+          TRANSFORMER_ENGINE_SWITCH_CONDITION(
+              with_gemm_swizzled_scales, WITH_GEMM_SWIZZLED_SCALES,
+
+              constexpr size_t input_type_bit_size = TypeInfo<IType>::size;
+              constexpr size_t output_type_bit_size = TypeInfo<OType>::size;
+
+              // Create base TMA descriptors.
+              // Input: stride = input_stride_elems (non-contiguous)
+              alignas(64) CUtensorMap tensor_map_input{};
+              {
+                SimpleTensor input_st(const_cast<void *>(input_data_ptr),
+                                      {rows, cols}, input_dtype);
+                create_2D_tensor_map(tensor_map_input, input_st,
+                                     rows, cols, BUFF_DIM_Y, BUFF_DIM_X,
+                                     input_stride_elems, 0, input_type_bit_size);
+              }
+
+              // Output rowwise: stride = cols (contiguous)
+              alignas(64) CUtensorMap tensor_map_output_rowwise{};
+              if (use_rowwise_scaling) {
+                create_2D_tensor_map(tensor_map_output_rowwise, output->data,
+                                     rows, cols, BUFF_DIM_Y, BUFF_DIM_X,
+                                     cols, 0, output_type_bit_size);
+              }
+
+              // Output colwise: stride = cols (contiguous)
+              alignas(64) CUtensorMap tensor_map_output_colwise{};
+              if (use_colwise_scaling) {
+                create_2D_tensor_map(tensor_map_output_colwise, output->columnwise_data,
+                                     rows, cols, BUFF_DIM_Y, BUFF_DIM_X,
+                                     cols, 0, output_type_bit_size);
+              }
+
+              // Update per-tensor TMA descriptors using strided kernel.
+              const IType *const typed_input_ptr =
+                  reinterpret_cast<const IType *>(input_data_ptr);
+              OType *const output_rowwise_dptr =
+                  use_rowwise_scaling ? reinterpret_cast<OType *>(output->data.dptr) : nullptr;
+              OType *const output_colwise_dptr =
+                  use_colwise_scaling ? reinterpret_cast<OType *>(output->columnwise_data.dptr)
+                                     : nullptr;
+
+              update_tma_descriptors_strided<IType, OType>
+                  <<<num_tensors, 32, 0, stream>>>(
+                  tensor_map_input,
+                  tensor_map_output_rowwise,
+                  tensor_map_output_colwise,
+                  typed_input_ptr,
+                  output_rowwise_dptr,
+                  output_colwise_dptr,
+                  num_tensors, rows, cols,
+                  input_byte_offsets_ptr,
+                  actual_offsets_ptr,  // actual output element offsets (for TMA)
+                  input_stride_elems,
+                  use_rowwise_scaling, use_colwise_scaling);
+
+              // Select kernel variant based on scaling type.
+              auto kernel =
+                  group_quantize_mxfp8_kernel<false, false, false, Empty, nullptr,
+                                              IType, OType, true, true,
+                                              WITH_GEMM_SWIZZLED_SCALES>;
+              switch (scaling_type) {
+                case ScalingType::ROWWISE: {
+                  kernel =
+                      group_quantize_mxfp8_kernel<false, false, false, Empty, nullptr,
+                                                  IType, OType, true, false,
+                                                  WITH_GEMM_SWIZZLED_SCALES>;
+                  break;
+                }
+                case ScalingType::COLWISE: {
+                  kernel =
+                      group_quantize_mxfp8_kernel<false, false, false, Empty, nullptr,
+                                                  IType, OType, false, true,
+                                                  WITH_GEMM_SWIZZLED_SCALES>;
+                  break;
+                }
+                case ScalingType::BIDIMENSIONAL: {
+                  break;
+                }
+              }
+
+              constexpr size_t buff_elems = BUFF_DIM_Y * BUFF_DIM_X;
+              constexpr size_t buff_elems_total = BUFFS_NUM * buff_elems;
+              constexpr size_t input_buff_size =
+                  (buff_elems_total * input_type_bit_size) / 8;
+              constexpr size_t output_buff_size =
+                  (buff_elems_total * output_type_bit_size) / 8;
+              constexpr size_t buff_size_aligned_in =
+                  DIVUP_TO_MULTIPLE(input_buff_size, TMA_SHMEM_ALIGNMENT);
+              constexpr size_t buff_size_aligned_out =
+                  DIVUP_TO_MULTIPLE(output_buff_size, TMA_SHMEM_ALIGNMENT);
+
+              constexpr size_t elt_input_mem = buff_size_aligned_in;
+              constexpr size_t in_mem = elt_input_mem;  // no activations
+
+              const size_t out_rowwise_mem =
+                  (use_rowwise_scaling ? buff_size_aligned_out : 0);
+              const size_t out_colwise_mem =
+                  (use_colwise_scaling ? buff_size_aligned_out : 0);
+              const size_t out_mem = out_rowwise_mem + out_colwise_mem;
+
+              const size_t dshmem_size = in_mem + out_mem + TMA_SHMEM_ALIGNMENT;
+
+              NVTE_CHECK_CUDA(cudaFuncSetAttribute(
+                  kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, dshmem_size));
+
+              // Dummy tensor map for act_input (unused in this path)
+              alignas(64) CUtensorMap tensor_map_act_input{};
+
+              kernel<<<grid, block_size, dshmem_size, stream>>>(
+                  tensor_map_input, tensor_map_act_input, tensor_map_output_rowwise,
+                  tensor_map_output_colwise, shape_rep, num_tensors,
+                  /*first_logical_dim=*/static_cast<size_t>(1),
+                  /*last_logical_dim=*/padded_elts_total,
+                  padded_offsets_ptr, first_dims_ptr, last_dims_ptr,
+                  scales_rowwise_ptr, scales_colwise_ptr,
+                  /*noop=*/nullptr, /*dbias_workspace=*/nullptr, amax_ptr);
+
+              NVTE_CHECK_CUDA(cudaGetLastError());
+          );  // NOLINT(*)
+      );      // NOLINT(*)
+  );          // NOLINT(*)
+
+  // Free the temporary padded offsets buffer.
+  NVTE_CHECK_CUDA(cudaFreeAsync(padded_offsets_ptr, stream));
 }
 
 }  // namespace mxfp8

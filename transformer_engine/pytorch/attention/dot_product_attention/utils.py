@@ -2293,11 +2293,200 @@ def permute_to_grouped_tensor(src_format, tensor):
     return tensor, des_format
 
 
+def _can_use_strided_mxfp8_quantize(src_format, tensor):
+    """Check if the fused strided MXFP8 quantize path is available.
+
+    Requirements:
+    - Blackwell GPU (sm_100+) for TMA-based strided quantize kernel
+    - SBHD or BSHD format (4D tensor with S not already in the right position)
+    - Contiguous input
+    - seqlen (S) divisible by 128
+    - B*H <= 256 (MAX_SUPPORTED_TENSOR_DESCRIPTORS)
+    """
+    if src_format in ["bhsd", "htd", "thd"]:
+        return False  # Already in target format or not supported
+    if src_format not in ["sbhd", "bshd"]:
+        return False
+    if not tensor.is_contiguous():
+        return False
+    if tensor.ndim != 4:
+        return False
+    # Check seqlen divisibility
+    s_dim = src_format.index("s")
+    S = tensor.shape[s_dim]
+    if S % 128 != 0:
+        return False
+    # Check total heads fit in descriptor limit
+    b_dim = src_format.index("b")
+    h_dim = src_format.index("h")
+    B = tensor.shape[b_dim]
+    H = tensor.shape[h_dim]
+    if B * H > 256:
+        return False
+    # Check GPU capability (need sm_100+ for Blackwell TMA)
+    if torch.cuda.get_device_capability()[0] < 10:
+        return False
+    return True
+
+
+def _mxfp8_quantize_strided(src_format, tensor, quantizer):
+    """Fused layout-permute + MXFP8 quantize via strided TMA reads.
+
+    Takes a contiguous SBHD (or BSHD) tensor, quantizes it to MXFP8 in BHSD order
+    without performing a BF16 permute+contiguous copy.
+
+    Parameters
+    ----------
+    src_format : str
+        Layout format, e.g. "sbhd" or "bshd"
+    tensor : torch.Tensor
+        4D contiguous tensor in src_format layout
+    quantizer : MXFP8Quantizer
+        Quantizer with rowwise/columnwise flags set
+
+    Returns
+    -------
+    MXFP8TensorStorage
+        Quantized tensor in BHSD layout with shape [B, H, S, D]
+    """
+    # Parse dims
+    s_dim = src_format.index("s")
+    b_dim = src_format.index("b")
+    h_dim = src_format.index("h")
+    d_dim = src_format.index("d")
+    S = tensor.shape[s_dim]
+    B = tensor.shape[b_dim]
+    H = tensor.shape[h_dim]
+    D = tensor.shape[d_dim]
+
+    num_heads = B * H
+    strides = tensor.stride()
+    elem_size = tensor.element_size()
+
+    # Compute input byte offsets for each head.
+    # Head (b, h) starts at element offset: b * strides[b_dim] + h * strides[h_dim]
+    # Byte offset = element_offset * elem_size
+    # For SBHD [S, B, H, D] with strides [B*H*D, H*D, D, 1]:
+    #   head (b,h) byte offset = (b * H*D + h * D) * elem_size
+    # For BSHD [B, S, H, D] with strides [S*H*D, H*D, D, 1]:
+    #   head (b,h) byte offset = (b * S*H*D + h * D) * elem_size
+    head_byte_offsets = []
+    for b in range(B):
+        for h in range(H):
+            offset_elems = b * strides[b_dim] + h * strides[h_dim]
+            head_byte_offsets.append(offset_elems * elem_size)
+
+    # Input row stride: distance in elements between consecutive S positions within a head
+    input_stride_elems = strides[s_dim]
+
+    # Sentinel value for offsets (num_heads+1 entries needed)
+    head_byte_offsets.append(0)  # sentinel, not used by kernel
+
+    input_byte_offsets_t = torch.tensor(head_byte_offsets, dtype=torch.int64, device=tensor.device)
+
+    # Call C++ strided quantize
+    rowwise_data, columnwise_data, scale_inv, columnwise_scale_inv = (
+        tex.group_quantize_strided(
+            tensor,
+            quantizer,
+            input_byte_offsets_t,
+            input_stride_elems,
+            S,   # rows
+            D,   # cols
+            num_heads,
+        )
+    )
+
+    # Split the flat output into per-head MXFP8Tensors.
+    # The output is a flat FP8 buffer of size [num_heads * S * D] with scales.
+    # For attention, we need the combined tensor in BHSD layout [B, H, S, D].
+    per_head_shape = (S, D)
+    per_head_numel = S * D
+
+    # Compute per-head scale shapes
+    rowwise_scale_shape = quantizer.get_scale_shape(per_head_shape, False)
+    colwise_scale_shape = quantizer.get_scale_shape(per_head_shape, True)
+    rowwise_scale_numel = rowwise_scale_shape[0] * rowwise_scale_shape[1]
+    colwise_scale_numel = colwise_scale_shape[0] * colwise_scale_shape[1]
+
+    # Create a single MXFP8TensorStorage with the full BHSD data.
+    # Shape: [B*H*S, D] — same as what the current code produces after permute+quantize.
+    bhsd_shape = (B * H * S, D)
+
+    # View scale tensors to 2D shape matching the full tensor
+    full_rowwise_scale_shape = quantizer.get_scale_shape(bhsd_shape, False)
+    full_colwise_scale_shape = quantizer.get_scale_shape(bhsd_shape, True)
+
+    rw_data = rowwise_data.view(bhsd_shape) if rowwise_data is not None else None
+    cw_data = columnwise_data.view(bhsd_shape) if columnwise_data is not None else None
+    rw_sinv = scale_inv.view(full_rowwise_scale_shape) if scale_inv is not None else None
+    cw_sinv = (
+        columnwise_scale_inv.view(full_colwise_scale_shape)
+        if columnwise_scale_inv is not None
+        else None
+    )
+
+    result = MXFP8TensorStorage(
+        rowwise_data=rw_data,
+        rowwise_scale_inv=rw_sinv,
+        columnwise_data=cw_data,
+        columnwise_scale_inv=cw_sinv,
+        fp8_dtype=quantizer.dtype,
+        quantizer=quantizer,
+        with_gemm_swizzled_scales=quantizer.optimize_for_gemm,
+        fake_dtype=tensor.dtype,
+    )
+
+    return result
+
+
 def combine_and_quantize(qkv_layout, q, k, v, qkv_quantizer):
     """Combine q,k,v based on qkv_layout and quantize them together"""
     if isinstance(qkv_quantizer, MXFP8Quantizer):
         qkv_format, q_format, kv_format = get_qkv_format(qkv_layout)
-        # permute q, k, v to bhsd/htd format
+
+        # Try fused strided quantize: reads SBHD/BSHD via per-head TMA, writes BHSD FP8.
+        # Eliminates the BF16 permute+contiguous copy for each of Q, K, V.
+        use_strided = (
+            _can_use_strided_mxfp8_quantize(q_format, q)
+            and _can_use_strided_mxfp8_quantize(kv_format, k)
+        )
+
+        if use_strided:
+            # Validate shapes on original tensors
+            S_q = q.shape[q_format.index("s")]
+            D_qk = q.shape[q_format.index("d")]
+            S_kv = v.shape[kv_format.index("s")]
+            D_v = v.shape[kv_format.index("d")]
+            assert S_q % 128 == 0 and S_kv % 128 == 0 and D_qk % 32 == 0 and D_v % 32 == 0, (
+                "MXFP8 quantization requires s_q % 128 == 0, s_kv % 128 == 0, d_qk % 32 == 0,"
+                f" d_v % 32 == 0. Found s_q={S_q}, s_kv={S_kv}, d_qk={D_qk}, d_v={D_v}."
+            )
+
+            q_fp8 = _mxfp8_quantize_strided(q_format, q, qkv_quantizer)
+            k_fp8 = _mxfp8_quantize_strided(kv_format, k, qkv_quantizer)
+            v_fp8 = _mxfp8_quantize_strided(kv_format, v, qkv_quantizer)
+
+            qkv_layout = "bhsd_bhsd_bhsd" if qkv_format != "thd" else "htd_htd_htd"
+
+            # View to BHSD shapes
+            B_q = q.shape[q_format.index("b")]
+            H_q = q.shape[q_format.index("h")]
+            B_kv = k.shape[kv_format.index("b")]
+            H_kv = k.shape[kv_format.index("h")]
+            D_k = k.shape[kv_format.index("d")]
+
+            original_shapes = [
+                (B_q, H_q, S_q, D_qk),
+                (B_kv, H_kv, S_kv, D_k),
+                (B_kv, H_kv, S_kv, D_v),
+            ]
+            q_fp8, k_fp8, v_fp8 = [
+                x.view(s) for x, s in zip([q_fp8, k_fp8, v_fp8], original_shapes)
+            ]
+            return q_fp8, k_fp8, v_fp8, qkv_layout
+
+        # Fallback: BF16 permute + quantize (original path)
         if q_format not in ["bhsd", "htd"]:
             q, _ = permute_to_grouped_tensor(q_format, q)
         if kv_format not in ["bhsd", "htd"]:

@@ -35,6 +35,31 @@ void nvte_group_quantize(const NVTEGroupedTensor input, NVTEGroupedTensor output
   dispatch::group_quantize_fwd_helper<IS_ACT, Empty, nullptr>(input, output, nullptr, stream);
 }
 
+void nvte_group_quantize_strided(NVTEGroupedTensor output,
+                                 NVTEDType input_dtype,
+                                 const void *input_data_ptr,
+                                 NVTETensor input_byte_offsets,
+                                 size_t input_stride_elems,
+                                 size_t rows,
+                                 size_t cols,
+                                 cudaStream_t stream) {
+  NVTE_API_CALL(nvte_group_quantize_strided);
+  using namespace transformer_engine;
+
+  GroupedTensor *output_tensor = convertNVTEGroupedTensorCheck(output);
+  const Tensor *offsets_tensor = convertNVTETensorCheck(input_byte_offsets);
+
+  dispatch::mxfp8::group_quantize_strided(
+      output_tensor,
+      static_cast<DType>(input_dtype),
+      input_data_ptr,
+      offsets_tensor->data,
+      input_stride_elems,
+      rows,
+      cols,
+      stream);
+}
+
 void nvte_quantize_noop(const NVTETensor input, NVTETensor output, NVTETensor noop,
                         cudaStream_t stream) {
   NVTE_API_CALL(nvte_quantize_noop);

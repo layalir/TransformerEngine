@@ -101,6 +101,32 @@ void nvte_quantize(const NVTETensor input, NVTETensor output, cudaStream_t strea
 void nvte_group_quantize(const NVTEGroupedTensor input, NVTEGroupedTensor output,
                          cudaStream_t stream);
 
+/*! \brief Quantize a strided (non-contiguous) input into a contiguous grouped MXFP8 output.
+ *
+ *  Reads sub-tensors from a non-contiguous input buffer using per-tensor byte offsets and
+ *  a uniform row stride, quantizes to MXFP8, and writes contiguously into the grouped output.
+ *  Designed for fusing SBHD->BHSD layout permutation with MXFP8 quantization in attention.
+ *
+ *  \param[in,out] output               Output grouped MXFP8 tensor (contiguous). Must have
+ *                                       tensor_offsets, first_dims, last_dims set.
+ *  \param[in]     input_dtype           Data type of the input (e.g., kBFloat16).
+ *  \param[in]     input_data_ptr        Base device pointer to the input data.
+ *  \param[in]     input_byte_offsets    Device int64_t[num_tensors+1]: byte offsets from
+ *                                       input_data_ptr to each sub-tensor start.
+ *  \param[in]     input_stride_elems    Row stride in elements (uniform for all sub-tensors).
+ *  \param[in]     rows                  Number of rows per sub-tensor.
+ *  \param[in]     cols                  Number of columns per sub-tensor.
+ *  \param[in]     stream                CUDA stream used for the operation.
+ */
+void nvte_group_quantize_strided(NVTEGroupedTensor output,
+                                 NVTEDType input_dtype,
+                                 const void *input_data_ptr,
+                                 NVTETensor input_byte_offsets,
+                                 size_t input_stride_elems,
+                                 size_t rows,
+                                 size_t cols,
+                                 cudaStream_t stream);
+
 /*! \brief Casts input tensor to FP8/MXFP8/BlockwiseFP8, providing the option to immediately exit the kernel
  *         based on the value of the 'noop' tensor.
  *         The type of quantized tensor in the output depends on the scaling mode of the output
