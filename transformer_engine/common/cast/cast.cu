@@ -16,6 +16,7 @@
 #include "../utils.cuh"
 #include "dispatch/dequantize.cuh"
 #include "dispatch/quantize.cuh"
+#include "mxfp8/quantize_mxfp8_sbhd.cuh"
 #include "transformer_engine/transpose.h"
 
 void nvte_quantize(const NVTETensor input, NVTETensor output, cudaStream_t stream) {
@@ -137,4 +138,33 @@ void nvte_group_nvfp4_quantize_with_amax(const NVTETensor input, NVTETensor *out
 
   dispatch::group_quantize_fwd_host_aware_helper<IS_ACT, Empty, nullptr>(
       input, outputs, split_sections, num_tensors, quant_config, stream);
+}
+
+void nvte_quantize_mxfp8_sbhd(const NVTETensor input, NVTETensor output,
+                               size_t S, size_t B, size_t H, size_t D,
+                               int src_layout, cudaStream_t stream) {
+  NVTE_API_CALL(nvte_quantize_mxfp8_sbhd);
+  using namespace transformer_engine;
+
+  const Tensor *input_tensor = convertNVTETensorCheck(input);
+  Tensor *output_tensor = convertNVTETensorCheck(output);
+
+  NVTE_CHECK(output_tensor->scaling_mode == NVTE_MXFP8_1D_SCALING,
+             "Output tensor must use MXFP8 scaling mode.");
+
+  const bool use_rowwise = output_tensor->has_data();
+  const bool use_colwise = output_tensor->has_columnwise_data();
+  const bool with_gemm_swizzled_scales = output_tensor->with_gemm_swizzled_scales;
+
+  using SrcLayout = dispatch::mxfp8::sbhd_kernel::SrcLayout;
+
+  if (src_layout == 0) {
+    dispatch::mxfp8::quantize_mxfp8_sbhd<SrcLayout::SBHD>(
+        *input_tensor, output_tensor, S, B, H, D,
+        use_rowwise, use_colwise, with_gemm_swizzled_scales, stream);
+  } else {
+    dispatch::mxfp8::quantize_mxfp8_sbhd<SrcLayout::BSHD>(
+        *input_tensor, output_tensor, S, B, H, D,
+        use_rowwise, use_colwise, with_gemm_swizzled_scales, stream);
+  }
 }

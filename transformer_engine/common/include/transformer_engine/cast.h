@@ -443,6 +443,25 @@ void nvte_group_nvfp4_quantize_with_amax(const NVTETensor input, NVTETensor *out
                                          const NVTEQuantizationConfig quant_config,
                                          cudaStream_t stream);
 
+/*! \brief Fused SBHD/BSHD -> BHSD permutation + MXFP8 quantization.
+ *
+ *  Takes a 4D input tensor in SBHD or BSHD memory layout, reads it in BHSD
+ *  logical order, and produces MXFP8-quantized output in BHSD-contiguous format.
+ *  This eliminates the need for a separate BF16/FP16 permute + contiguous copy.
+ *
+ *  \param[in]     input            Input tensor (contiguous in SBHD or BSHD layout).
+ *  \param[in,out] output           Output MXFP8 tensor (contiguous in BHSD layout).
+ *  \param[in]     S                Sequence length dimension.
+ *  \param[in]     B                Batch dimension.
+ *  \param[in]     H                Head dimension.
+ *  \param[in]     D                Per-head dimension.
+ *  \param[in]     src_layout       0 = SBHD, 1 = BSHD.
+ *  \param[in]     stream           CUDA stream used for the operation.
+ */
+void nvte_quantize_mxfp8_sbhd(const NVTETensor input, NVTETensor output,
+                               size_t S, size_t B, size_t H, size_t D,
+                               int src_layout, cudaStream_t stream);
+
 #ifdef __cplusplus
 }  // extern "C"
 #endif

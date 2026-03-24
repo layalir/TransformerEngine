@@ -310,6 +310,10 @@ py::object dequantize(const py::handle &input, DType otype);
 py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const size_t num_tensors,
                           std::optional<at::Tensor> first_dims);
 
+py::object quantize_mxfp8_sbhd(const at::Tensor &tensor, py::handle quantizer,
+                               size_t S, size_t B, size_t H, size_t D,
+                               int src_layout);
+
 std::vector<py::object> multi_tensor_quantize(const std::vector<at::Tensor> &tensor_list,
                                               std::vector<py::handle> quantizer_list);
 

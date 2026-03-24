@@ -232,6 +232,34 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
   return py::reinterpret_borrow<py::object>(grouped_output_py);
 }
 
+py::object quantize_mxfp8_sbhd(const at::Tensor &tensor, py::handle quantizer,
+                               size_t S, size_t B, size_t H, size_t D,
+                               int src_layout) {
+  using namespace transformer_engine::pytorch::detail;
+  init_extension();
+
+  NVTE_CHECK(detail::IsMXFP8Quantizers(quantizer.ptr()),
+             "quantize_mxfp8_sbhd: only MXFP8 quantizer is supported.");
+
+  // Input tensor is contiguous in SBHD or BSHD layout.
+  // We do NOT call .contiguous() -- the kernel reads with address remapping.
+  auto input_cpp = makeTransformerEngineTensor(tensor);
+
+  // Create output tensor with BHSD shape: [B*H*S, D]
+  auto quantizer_cpp = convert_quantizer(quantizer);
+  const std::vector<size_t> output_shape = {B * H * S, D};
+  const auto fake_dtype = input_cpp.dtype();
+  auto [output_cpp, output_py] = quantizer_cpp->create_tensor(output_shape, fake_dtype);
+
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_quantize_mxfp8_sbhd(input_cpp.data(), output_cpp.data(),
+                              S, B, H, D, src_layout,
+                              at::cuda::getCurrentCUDAStream());
+  });
+
+  return output_py;
+}
+
 py::object dequantize(const py::handle &input, transformer_engine::DType otype) {
   init_extension();
 

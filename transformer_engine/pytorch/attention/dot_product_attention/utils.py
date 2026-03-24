@@ -2293,11 +2293,110 @@ def permute_to_grouped_tensor(src_format, tensor):
     return tensor, des_format
 
 
+def _quantize_mxfp8_sbhd_fused(tensor, src_format, qkv_quantizer):
+    """Fused SBHD/BSHD->BHSD permutation + MXFP8 quantization via custom kernel.
+
+    Takes a 4D tensor in SBHD or BSHD layout and produces an MXFP8 quantized
+    tensor in BHSD layout without an intermediate BF16/FP16 copy.
+
+    Args:
+        tensor: Input tensor, contiguous in SBHD [S,B,H,D] or BSHD [B,S,H,D].
+        src_format: "sbhd" or "bshd".
+        qkv_quantizer: MXFP8Quantizer instance.
+
+    Returns:
+        MXFP8 quantized tensor in BHSD [B,H,S,D] layout (4D).
+    """
+    assert src_format in ("sbhd", "bshd"), f"Unsupported format: {src_format}"
+    tensor = tensor.contiguous() if not tensor.is_contiguous() else tensor
+
+    if src_format == "sbhd":
+        S, B, H, D = tensor.shape
+        src_layout = 0
+    else:
+        B, S, H, D = tensor.shape
+        src_layout = 1
+
+    assert (B * H * S) % 128 == 0 and D % 32 == 0, (
+        f"MXFP8 fused SBHD quantization requires B*H*S % 128 == 0 and D % 32 == 0. "
+        f"Got B={B}, H={H}, S={S} (B*H*S={B*H*S}), D={D}."
+    )
+
+    # Call fused kernel: reads SBHD/BSHD, writes MXFP8 in BHSD = [B*H*S, D]
+    fp8_tensor = tex.quantize_mxfp8_sbhd(tensor, qkv_quantizer, S, B, H, D, src_layout)
+    # View the flat [B*H*S, D] output as 4D BHSD [B, H, S, D]
+    fp8_tensor = fp8_tensor.view(B, H, S, D)
+    return fp8_tensor
+
+
 def combine_and_quantize(qkv_layout, q, k, v, qkv_quantizer):
     """Combine q,k,v based on qkv_layout and quantize them together"""
     if isinstance(qkv_quantizer, MXFP8Quantizer):
         qkv_format, q_format, kv_format = get_qkv_format(qkv_layout)
-        # permute q, k, v to bhsd/htd format
+
+        # Check if we can use the fused SBHD->BHSD+MXFP8 kernel
+        _use_fused_sbhd = q_format in ("sbhd", "bshd") or kv_format in ("sbhd", "bshd")
+
+        if _use_fused_sbhd:
+            # Fused path: skip permute_to_grouped_tensor BF16 copies.
+            # Quantize each tensor individually with the fused kernel.
+            if q_format in ("sbhd", "bshd"):
+                q_fp8 = _quantize_mxfp8_sbhd_fused(q, q_format, qkv_quantizer)
+            elif q_format not in ("bhsd", "htd"):
+                q, _ = permute_to_grouped_tensor(q_format, q)
+                q_fp8 = None  # will be quantized below
+            else:
+                q_fp8 = None
+
+            if kv_format in ("sbhd", "bshd"):
+                k_fp8 = _quantize_mxfp8_sbhd_fused(k, kv_format, qkv_quantizer)
+                v_fp8 = _quantize_mxfp8_sbhd_fused(v, kv_format, qkv_quantizer)
+            elif kv_format not in ("bhsd", "htd"):
+                k, _ = permute_to_grouped_tensor(kv_format, k)
+                v, _ = permute_to_grouped_tensor(kv_format, v)
+                k_fp8 = None
+                v_fp8 = None
+            else:
+                k_fp8 = None
+                v_fp8 = None
+
+            # For any tensor not already quantized by the fused kernel, use the
+            # existing grouped quantize path (already in bhsd/htd format).
+            not_yet = [x is None for x in [q_fp8, k_fp8, v_fp8]]
+            if any(not_yet):
+                remaining_tensors = []
+                remaining_indices = []
+                for idx, (t, is_none) in enumerate(zip([q, k, v], not_yet)):
+                    if is_none:
+                        remaining_tensors.append(t)
+                        remaining_indices.append(idx)
+                # Flatten for grouped quantize
+                remaining_flat = [t.view(-1, t.shape[-1]) for t in remaining_tensors]
+                shapes = [t.shape for t in remaining_flat]
+                grouped_tensor = GroupedTensor.make_grouped_tensor_with_shapes(
+                    num_tensors=len(remaining_flat),
+                    shapes=shapes,
+                    quantizer=qkv_quantizer,
+                    device="cuda",
+                    dtype=remaining_flat[0].dtype,
+                )
+                quantized = grouped_tensor.quantize(remaining_flat)
+                # Restore original 4D shapes
+                for j, idx in enumerate(remaining_indices):
+                    orig = [q, k, v][idx]
+                    # Original is already in bhsd: [B, H, S, D] shape
+                    qs = quantized[j].view(orig.shape)
+                    if idx == 0:
+                        q_fp8 = qs
+                    elif idx == 1:
+                        k_fp8 = qs
+                    else:
+                        v_fp8 = qs
+
+            qkv_layout = "bhsd_bhsd_bhsd" if qkv_format != "thd" else "htd_htd_htd"
+            return q_fp8, k_fp8, v_fp8, qkv_layout
+
+        # Fallback: original path for thd or already-bhsd formats
         if q_format not in ["bhsd", "htd"]:
             q, _ = permute_to_grouped_tensor(q_format, q)
         if kv_format not in ["bhsd", "htd"]:
