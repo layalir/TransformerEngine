@@ -1374,18 +1374,6 @@ class FusedAttnFunc(torch.autograd.Function):
                     return_max_logit,
                     is_graph_capturing(),
                 )
-                if torch.cuda.current_device() == 0:
-                    print(
-                        f"L{layer_number}: real/shadow out   min:"
-                        f" {out_.min():.4f}/{out_f16_.min():.4f}, max:"
-                        f" {out_.max():.4f}/{out_f16_.max():.4f}"
-                    )
-                    print(
-                        f"L{layer_number}: real/shadow stats min:"
-                        f" {aux_ctx_tensors[0].min():.4f}/{aux_ctx_tensors_f16[0].min():.4f}, max:"
-                        f" {aux_ctx_tensors[0].max():.4f}/{aux_ctx_tensors_f16[0].max():.4f}"
-                    )
-
             # out_fp8: Float8Tensor/MXFP8Tensor; dtype = torch.float16 or torch.bfloat16
             #                        fp8_dtype = tex.DType.kFloat8E4M3
             # out:     torch.Tensor; dtype = torch.float16 or torch.bfloat16
@@ -1824,23 +1812,6 @@ class FusedAttnFunc(torch.autograd.Function):
                             dk_ = dk_shadow_f16
                         if _replace_dv_with_shadow_f16:
                             dv_ = dv_shadow_f16
-                        if torch.cuda.current_device() == 0:
-                            print(
-                                f"L{ctx.layer_number}: real/shadow dq min:"
-                                f" {dq_.min():.4f}/{dq_shadow_f16.min():.4f}, max:"
-                                f" {dq_.max():.4f}/{dq_shadow_f16.max():.4f}"
-                            )
-                            print(
-                                f"L{ctx.layer_number}: real/shadow dk min:"
-                                f" {dk_.min():.4f}/{dk_shadow_f16.min():.4f}, max:"
-                                f" {dk_.max():.4f}/{dk_shadow_f16.max():.4f}"
-                            )
-                            print(
-                                f"L{ctx.layer_number}: real/shadow dv min:"
-                                f" {dv_.min():.4f}/{dv_shadow_f16.min():.4f}, max:"
-                                f" {dv_.max():.4f}/{dv_shadow_f16.max():.4f}"
-                            )
-
                     # dq, dk, dv:             torch.Tensor; dtype = torch.float16 or torch.bfloat16
                     dq, dk, dv = dq_, dk_, dv_
                     is_quantized_tensor = isinstance(dq_, QuantizedTensorStorage)
