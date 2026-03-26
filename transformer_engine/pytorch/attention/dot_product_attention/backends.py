@@ -1674,7 +1674,7 @@ class FusedAttnFunc(torch.autograd.Function):
         ) = restore_from_saved(ctx.tensor_objects, ctx.saved_tensors)
 
         aux_ctx_tensors = other_tensors
-        aux_ctx_tensors_shadow_f16 = aux_ctx_tensors
+        aux_ctx_tensors_shadow_f16 = list(aux_ctx_tensors)
         out_shadow_f16 = out
         original_qkv_layout = ctx.dqkv_layout
         original_qkv_format, *_ = dpa_utils.get_qkv_format(original_qkv_layout)
