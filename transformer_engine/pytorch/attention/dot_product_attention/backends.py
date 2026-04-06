@@ -164,6 +164,38 @@ _replace_dk_with_shadow_f16 = os.getenv("NVTE_REPLACE_DK_WITH_SHADOW_F16", "0") 
 _replace_dv_with_shadow_f16 = os.getenv("NVTE_REPLACE_DV_WITH_SHADOW_F16", "0") == "1"
 _qdq_dO_in_mxfp8_bprop = os.getenv("NVTE_QDQ_DO_IN_MXFP8_BPROP", "0") == "1"
 _qdq_dO_in_f16_bprop = os.getenv("NVTE_QDQ_DO_IN_F16_BPROP", "0") == "1"
+_check_nan_attn = os.getenv("NVTE_CHECK_NAN_ATTN", "0") == "1"
+
+
+def _nan_check(tensor, name: str, layer_number=None) -> None:
+    """Check tensor for NaN/inf and log a warning if found. No-op when _check_nan_attn is False."""
+    if not _check_nan_attn:
+        return
+    if tensor is None:
+        return
+    t = tensor
+    if isinstance(t, QuantizedTensorStorage):
+        t = t.dequantize()
+    if not t.is_floating_point():
+        return
+    if not torch.isfinite(t).all():
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        layer_str = f" layer={layer_number}" if layer_number is not None else ""
+        has_nan = torch.isnan(t).any().item()
+        has_inf = torch.isinf(t).any().item()
+        flags = []
+        if has_nan:
+            flags.append("NaN")
+        if has_inf:
+            flags.append("Inf")
+        logging.warning(
+            "NVTE_CHECK_NAN_ATTN: %s detected in %s%s on rank %d (shape=%s)",
+            "+".join(flags),
+            name,
+            layer_str,
+            rank,
+            list(t.shape),
+        )
 
 
 class FP8EmulationFunc(torch.autograd.Function):
@@ -1288,6 +1320,10 @@ class FusedAttnFunc(torch.autograd.Function):
                     qkv_layout, q, k, v, QKV_quantizer, used_in_backward=is_training
                 )
 
+            _nan_check(q_fp8, "q_fp8", layer_number)
+            _nan_check(k_fp8, "k_fp8", layer_number)
+            _nan_check(v_fp8, "v_fp8", layer_number)
+
             # print quantizers
             print_quantizers(
                 "FusedAttnFunc.forward >> before: ",
@@ -1337,6 +1373,7 @@ class FusedAttnFunc(torch.autograd.Function):
                 softmax_offset,
                 cuda_graph=is_graph_capturing(),
             )
+            _nan_check(out_, "out_fp8_fwd", layer_number)
 
             if _run_shadow_f16_fwd:
                 # q, k, v, out_: torch.Tensor; dtype = torch.float16 or torch.bfloat16
@@ -1659,6 +1696,7 @@ class FusedAttnFunc(torch.autograd.Function):
                 d_out_fp8 = d_out
             else:
                 d_out_fp8 = ctx.dO_quantizer(d_out)
+        _nan_check(d_out, "d_out_bwd", ctx.layer_number)
         (
             q_fp8,
             k_fp8,
@@ -1793,6 +1831,9 @@ class FusedAttnFunc(torch.autograd.Function):
                         ctx.deterministic,
                         is_graph_capturing(),
                     )
+                    _nan_check(dq_, "dq_mxfp8", ctx.layer_number)
+                    _nan_check(dk_, "dk_mxfp8", ctx.layer_number)
+                    _nan_check(dv_, "dv_mxfp8", ctx.layer_number)
                     if _run_shadow_f16_bwd:
                         original_qkv_layout = ctx.dqkv_layout
                         tmp_quantizer = ctx.QKV_quantizer.copy()
@@ -1848,6 +1889,9 @@ class FusedAttnFunc(torch.autograd.Function):
                             ctx.deterministic,
                             is_graph_capturing(),
                         )
+                        _nan_check(dq_shadow_f16, "dq_shadow_f16", ctx.layer_number)
+                        _nan_check(dk_shadow_f16, "dk_shadow_f16", ctx.layer_number)
+                        _nan_check(dv_shadow_f16, "dv_shadow_f16", ctx.layer_number)
                         if _replace_dq_with_shadow_f16:
                             dq_ = dq_shadow_f16
                         if _replace_dk_with_shadow_f16:
@@ -1888,6 +1932,10 @@ class FusedAttnFunc(torch.autograd.Function):
                         dq, dk, dv, _ = combine_and_quantize(
                             ctx.dqkv_layout, dq_, dk_, dv_, ctx.dQKV_quantizer
                         )
+
+                    _nan_check(dq, "dq_final", ctx.layer_number)
+                    _nan_check(dk, "dk_final", ctx.layer_number)
+                    _nan_check(dv, "dv_final", ctx.layer_number)
 
                     # print quantizers
                     print_quantizers(
