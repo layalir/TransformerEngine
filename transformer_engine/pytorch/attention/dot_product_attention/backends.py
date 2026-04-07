@@ -196,19 +196,26 @@ def _nan_check(tensor, name: str, layer_number=None) -> None:
             buf = getattr(tensor, attr, None)
             if buf is None:
                 continue
+            n_total = buf.numel()
             if is_scale:
                 # E8M0: 0xFF encodes 2^128 — scale saturated / input overflowed
-                if (buf == 0xFF).any():
+                n_sat = (buf == 0xFF).sum().item()
+                if n_sat > 0:
                     logging.warning(
-                        "NVTE_CHECK_NAN_ATTN: E8M0 scale saturated (0xFF) in %s%s rank=%d shape=%s",
+                        "NVTE_CHECK_NAN_ATTN: E8M0 scale saturated (0xFF) in %s%s "
+                        "rank=%d shape=%s saturated=%d/%d (%.2f%%)",
                         label, layer_str, rank, list(buf.shape),
+                        n_sat, n_total, 100.0 * n_sat / n_total,
                     )
             else:
                 # FP8 E4M3: NaN when lower 7 bits all set (0x7F or 0xFF)
-                if ((buf & 0x7F) == 0x7F).any():
+                n_nan = ((buf & 0x7F) == 0x7F).sum().item()
+                if n_nan > 0:
                     logging.warning(
-                        "NVTE_CHECK_NAN_ATTN: FP8 E4M3 NaN in %s%s rank=%d shape=%s",
+                        "NVTE_CHECK_NAN_ATTN: FP8 E4M3 NaN in %s%s "
+                        "rank=%d shape=%s nan=%d/%d (%.2f%%)",
                         label, layer_str, rank, list(buf.shape),
+                        n_nan, n_total, 100.0 * n_nan / n_total,
                     )
 
     # --- Dequantized float check (covers regular tensors and catches Inf from scale overflow) ---
@@ -222,16 +229,23 @@ def _nan_check(tensor, name: str, layer_number=None) -> None:
     if not t.is_floating_point():
         return
     if not torch.isfinite(t).all():
-        has_nan = torch.isnan(t).any().item()
-        has_inf = torch.isinf(t).any().item()
+        n_total = t.numel()
+        n_nan = torch.isnan(t).sum().item()
+        n_inf = torch.isinf(t).sum().item()
+        finite = t[torch.isfinite(t)]
+        stats = (
+            f"min={finite.min().item():.4g} max={finite.max().item():.4g}"
+            if finite.numel() > 0
+            else "no-finite-values"
+        )
         flags = []
-        if has_nan:
-            flags.append("NaN")
-        if has_inf:
-            flags.append("Inf")
+        if n_nan:
+            flags.append(f"NaN={n_nan}")
+        if n_inf:
+            flags.append(f"Inf={n_inf}")
         logging.warning(
-            "NVTE_CHECK_NAN_ATTN: %s in dequantized %s%s rank=%d shape=%s",
-            "+".join(flags), name, layer_str, rank, list(t.shape),
+            "NVTE_CHECK_NAN_ATTN: %s in dequantized %s%s rank=%d shape=%s total=%d %s",
+            " ".join(flags), name, layer_str, rank, list(t.shape), n_total, stats,
         )
 
 
