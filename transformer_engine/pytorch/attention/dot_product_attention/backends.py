@@ -181,6 +181,9 @@ def _nan_check(tensor, name: str, layer_number=None) -> None:
         return
     if tensor is None:
         return
+    # Skip during CUDA graph capture — kernel launches are not permitted
+    if torch.cuda.is_current_stream_capturing():
+        return
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     layer_str = f" layer={layer_number}" if layer_number is not None else ""
 
