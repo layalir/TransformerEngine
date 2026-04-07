@@ -168,19 +168,60 @@ _check_nan_attn = os.getenv("NVTE_CHECK_NAN_ATTN", "0") == "1"
 
 
 def _nan_check(tensor, name: str, layer_number=None) -> None:
-    """Check tensor for NaN/inf and log a warning if found. No-op when _check_nan_attn is False."""
+    """Check tensor for NaN/inf and log a warning if found. No-op when _check_nan_attn is False.
+
+    For MXFP8 tensors, inspects raw uint8 buffers directly before dequantizing:
+      - FP8 E4M3 data:   NaN when lower 7 bits are all 1  ((buf & 0x7F) == 0x7F)
+      - E8M0 scale_inv:  saturated when value == 0xFF (scale = 2^128, overflow)
+    Then also checks the dequantized float values for non-finite, which catches
+    remaining cases such as regular FP16/BF16 tensors or Inf from scale overflow.
+    """
     if not _check_nan_attn:
         return
     if tensor is None:
         return
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    layer_str = f" layer={layer_number}" if layer_number is not None else ""
+
+    # --- Raw MXFP8 buffer checks ---
+    # _rowwise_data / _columnwise_data: uint8, FP8 E4M3 encoding.
+    # _rowwise_scale_inv / _columnwise_scale_inv: uint8, E8M0 encoding.
+    if hasattr(tensor, "_rowwise_data"):
+        for attr, label, is_scale in (
+            ("_rowwise_data", f"{name}.rowwise_data", False),
+            ("_columnwise_data", f"{name}.colwise_data", False),
+            ("_rowwise_scale_inv", f"{name}.rowwise_scale_inv", True),
+            ("_columnwise_scale_inv", f"{name}.colwise_scale_inv", True),
+        ):
+            buf = getattr(tensor, attr, None)
+            if buf is None:
+                continue
+            if is_scale:
+                # E8M0: 0xFF encodes 2^128 — scale saturated / input overflowed
+                if (buf == 0xFF).any():
+                    logging.warning(
+                        "NVTE_CHECK_NAN_ATTN: E8M0 scale saturated (0xFF) in %s%s rank=%d shape=%s",
+                        label, layer_str, rank, list(buf.shape),
+                    )
+            else:
+                # FP8 E4M3: NaN when lower 7 bits all set (0x7F or 0xFF)
+                if ((buf & 0x7F) == 0x7F).any():
+                    logging.warning(
+                        "NVTE_CHECK_NAN_ATTN: FP8 E4M3 NaN in %s%s rank=%d shape=%s",
+                        label, layer_str, rank, list(buf.shape),
+                    )
+
+    # --- Dequantized float check (covers regular tensors and catches Inf from scale overflow) ---
+    # Skip dequantize when scales are in GEMM-swizzled format: the dequantize kernel asserts
+    # compact (non-swizzled) scales and will crash. Raw buffer checks above still apply.
     t = tensor
     if isinstance(t, QuantizedTensorStorage):
+        if getattr(t, "_with_gemm_swizzled_scales", False):
+            return
         t = t.dequantize()
     if not t.is_floating_point():
         return
     if not torch.isfinite(t).all():
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        layer_str = f" layer={layer_number}" if layer_number is not None else ""
         has_nan = torch.isnan(t).any().item()
         has_inf = torch.isinf(t).any().item()
         flags = []
@@ -189,12 +230,8 @@ def _nan_check(tensor, name: str, layer_number=None) -> None:
         if has_inf:
             flags.append("Inf")
         logging.warning(
-            "NVTE_CHECK_NAN_ATTN: %s detected in %s%s on rank %d (shape=%s)",
-            "+".join(flags),
-            name,
-            layer_str,
-            rank,
-            list(t.shape),
+            "NVTE_CHECK_NAN_ATTN: %s in dequantized %s%s rank=%d shape=%s",
+            "+".join(flags), name, layer_str, rank, list(t.shape),
         )
 
 
