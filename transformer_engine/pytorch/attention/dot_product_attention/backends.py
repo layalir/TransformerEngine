@@ -8,6 +8,7 @@ from importlib.metadata import version as get_pkg_version
 from importlib.metadata import PackageNotFoundError
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+import sys
 import warnings
 import logging
 from packaging.version import Version as PkgVersion
@@ -201,21 +202,21 @@ def _nan_check(tensor, name: str, layer_number=None) -> None:
                 # E8M0: 0xFF encodes 2^128 — scale saturated / input overflowed
                 n_sat = (buf == 0xFF).sum().item()
                 if n_sat > 0:
-                    logging.warning(
-                        "NVTE_CHECK_NAN_ATTN: E8M0 scale saturated (0xFF) in %s%s "
-                        "rank=%d shape=%s saturated=%d/%d (%.2f%%)",
-                        label, layer_str, rank, list(buf.shape),
-                        n_sat, n_total, 100.0 * n_sat / n_total,
+                    print(
+                        f"NVTE_CHECK_NAN_ATTN: E8M0 scale saturated (0xFF) in {label}{layer_str} "
+                        f"rank={rank} shape={list(buf.shape)} saturated={n_sat}/{n_total} "
+                        f"({100.0 * n_sat / n_total:.2f}%)",
+                        file=sys.stderr, flush=True,
                     )
             else:
                 # FP8 E4M3: NaN when lower 7 bits all set (0x7F or 0xFF)
                 n_nan = ((buf & 0x7F) == 0x7F).sum().item()
                 if n_nan > 0:
-                    logging.warning(
-                        "NVTE_CHECK_NAN_ATTN: FP8 E4M3 NaN in %s%s "
-                        "rank=%d shape=%s nan=%d/%d (%.2f%%)",
-                        label, layer_str, rank, list(buf.shape),
-                        n_nan, n_total, 100.0 * n_nan / n_total,
+                    print(
+                        f"NVTE_CHECK_NAN_ATTN: FP8 E4M3 NaN in {label}{layer_str} "
+                        f"rank={rank} shape={list(buf.shape)} nan={n_nan}/{n_total} "
+                        f"({100.0 * n_nan / n_total:.2f}%)",
+                        file=sys.stderr, flush=True,
                     )
 
     # --- Dequantized float check (covers regular tensors and catches Inf from scale overflow) ---
@@ -243,9 +244,10 @@ def _nan_check(tensor, name: str, layer_number=None) -> None:
             flags.append(f"NaN={n_nan}")
         if n_inf:
             flags.append(f"Inf={n_inf}")
-        logging.warning(
-            "NVTE_CHECK_NAN_ATTN: %s in dequantized %s%s rank=%d shape=%s total=%d %s",
-            " ".join(flags), name, layer_str, rank, list(t.shape), n_total, stats,
+        print(
+            f"NVTE_CHECK_NAN_ATTN: {' '.join(flags)} in dequantized {name}{layer_str} "
+            f"rank={rank} shape={list(t.shape)} total={n_total} {stats}",
+            file=sys.stderr, flush=True,
         )
 
 
