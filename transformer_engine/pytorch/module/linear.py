@@ -6,9 +6,47 @@
 from typing import Callable, Dict, Optional, Tuple, Union, List
 from functools import reduce
 from operator import mul as multiply_op
+import os
+import sys
 import warnings
 
 import torch
+
+_check_nan_linear = os.getenv("NVTE_CHECK_NAN_ATTN", "0") == "1"
+
+
+def _nan_check_linear(tensor, name: str, ub_name=None) -> None:
+    """Check wgrad/dgrad for NaN/Inf after te.Linear backward. Reuses NVTE_CHECK_NAN_ATTN."""
+    if not _check_nan_linear:
+        return
+    if tensor is None:
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    if not tensor.is_floating_point():
+        return
+    if not torch.isfinite(tensor).all():
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        n_total = tensor.numel()
+        n_nan = torch.isnan(tensor).sum().item()
+        n_inf = torch.isinf(tensor).sum().item()
+        finite = tensor[torch.isfinite(tensor)]
+        stats = (
+            f"min={finite.min().item():.4g} max={finite.max().item():.4g}"
+            if finite.numel() > 0
+            else "no-finite-values"
+        )
+        flags = []
+        if n_nan:
+            flags.append(f"NaN={n_nan}")
+        if n_inf:
+            flags.append(f"Inf={n_inf}")
+        layer_str = f" ub={ub_name}" if ub_name else ""
+        print(
+            f"NVTE_CHECK_NAN_ATTN: {' '.join(flags)} in Linear.bwd {name}{layer_str} "
+            f"rank={rank} shape={list(tensor.shape)} total={n_total} {stats}",
+            file=sys.stderr, flush=True,
+        )
 
 import transformer_engine_torch as tex
 
@@ -969,6 +1007,10 @@ class _Linear(torch.autograd.Function):
         # Scatter fp8 weight buffers
         if ctx.fp8 and not isinstance(weight, QuantizedTensorStorage):
             _fsdp_scatter_tensors(ctx.fsdp_group, weight_fp8)
+
+        _nan_check_linear(wgrad, "wgrad", ub_name=ctx.ub_name)
+        _nan_check_linear(dgrad, "dgrad", ub_name=ctx.ub_name)
+
         return (
             wgrad,
             dgrad.view(ctx.inp_shape) if ctx.requires_dgrad else None,
