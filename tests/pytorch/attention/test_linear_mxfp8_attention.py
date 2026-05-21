@@ -17,12 +17,21 @@ Expected output (GB200, b=1, s=4096):
       Speedup: 1.58x
 """
 
+import os
+import pathlib
+import sys
+
 import pytest
 import torch
 
 import transformer_engine.pytorch as te
 from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+from transformer_engine.pytorch.attention.dot_product_attention import _attention_backends
+from transformer_engine.pytorch.utils import get_cudnn_version
 
+_current_file = pathlib.Path(__file__).resolve()
+sys.path = [str(_current_file.parent.parent)] + sys.path
+from utils import ModelConfig, get_available_attention_backends
 from mla_rope_utils import apply_mla_rope
 
 
@@ -46,6 +55,10 @@ SEED          = 42
 
 WARMUP_ITERS = 10
 TIMED_ITERS  = 100
+_DETERMINISTIC = (
+    not bool(int(os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")))
+    or torch.are_deterministic_algorithms_enabled()
+)
 
 
 @pytest.fixture(autouse=True)
@@ -84,6 +97,44 @@ def _build_modules(dtype: torch.dtype = torch.bfloat16):
         m.train()
 
     return base, mxfp8
+
+
+def _require_attention_backends(batch_size: int, seq_len: int, fp8_recipe) -> None:
+    if get_cudnn_version() < (9, 2, 1):
+        pytest.skip("cuDNN 9.2.1+ is required for FP8 fused attention.")
+
+    config = ModelConfig(
+        batch_size,
+        seq_len,
+        NUM_HEADS,
+        HEAD_DIM_QK,
+        head_dim_v=HEAD_DIM_V,
+    )
+    fp8_meta = {"recipe": fp8_recipe}
+    fp8_backends, _, _ = get_available_attention_backends(
+        config,
+        qkv_dtype=torch.float8_e4m3fn,
+        qkv_layout="sbhd_sbhd_sbhd",
+        fp8=True,
+        fp8_meta=fp8_meta,
+        is_training=True,
+        deterministic=_DETERMINISTIC,
+    )
+    flash_attn_supported, fused_attn_supported_fp8, _ = fp8_backends
+    if flash_attn_supported + fused_attn_supported_fp8 < 1:
+        pytest.skip("No FP8 attention backend available for DSv3 MLA shape.")
+
+    bf16_backends, _, _ = get_available_attention_backends(
+        config,
+        qkv_dtype=torch.bfloat16,
+        qkv_layout="sbhd_sbhd_sbhd",
+        is_training=True,
+        deterministic=_DETERMINISTIC,
+    )
+    if sum(bf16_backends) < 1:
+        pytest.skip("No BF16 attention backend available for DSv3 MLA shape.")
+
+    _attention_backends["backend_selection_requires_update"] = True
 
 
 def _split_qkv(qkv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -160,10 +211,11 @@ class TestLinearMXFP8Attention:
 
     def test_accuracy(self, batch_size: int, seq_len: int) -> None:
         """Tolerances are loose (uncalibrated scales); catches NaN/zero/sign-flip, not precision."""
+        fp8_recipe = MXFP8BlockScaling(fp8_dpa=True)
+        _require_attention_backends(batch_size, seq_len, fp8_recipe)
         _set_seed()
         baseline_modules, mxfp8_modules = _build_modules()
         x = torch.randn(seq_len, batch_size, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
-        fp8_recipe = MXFP8BlockScaling(fp8_dpa=True)
 
         qkv_bf16, out_bf16 = _run_forward_bf16(baseline_modules, x)
         qkv_mxfp8, out_mxfp8 = _run_forward_mxfp8(mxfp8_modules, x, fp8_recipe)
@@ -188,9 +240,10 @@ class TestLinearMXFP8Attention:
 
     def test_backward(self, batch_size: int, seq_len: int) -> None:
         """Gradients must flow end-to-end without NaN/Inf."""
+        fp8_recipe = MXFP8BlockScaling(fp8_dpa=True)
+        _require_attention_backends(batch_size, seq_len, fp8_recipe)
         _set_seed()
         _, mxfp8_modules = _build_modules()
-        fp8_recipe = MXFP8BlockScaling(fp8_dpa=True)
 
         x = torch.randn(
             seq_len, batch_size, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda",
@@ -215,13 +268,18 @@ class TestLinearMXFP8Attention:
         print(f"\n[BPROP] b={batch_size} s={seq_len}: dx rms={dx_rms:.6f}")
         assert dx_rms > 0.0, "MXFP8 path: input grad is all zeros (no gradient flow)"
 
+    @pytest.mark.skipif(
+        os.getenv("RUN_BENCHMARK_TESTS", "0") != "1",
+        reason="Benchmark test - run with RUN_BENCHMARK_TESTS=1 pytest -k performance",
+    )
     def test_performance(self, batch_size: int, seq_len: int) -> None:
         """MXFP8 must be faster than BF16. Weights pre-cached via is_first_microbatch=True
         (pre-quantized weights reused each iteration, no per-iteration weight quantization)."""
+        fp8_recipe = MXFP8BlockScaling(fp8_dpa=True)
+        _require_attention_backends(batch_size, seq_len, fp8_recipe)
         _set_seed()
         baseline_modules, mxfp8_modules = _build_modules()
         x = torch.randn(seq_len, batch_size, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
-        fp8_recipe = MXFP8BlockScaling(fp8_dpa=True)
 
         with torch.no_grad():
             _run_forward_mxfp8(mxfp8_modules, x, fp8_recipe, is_first_microbatch=True)

@@ -2,10 +2,15 @@
 #
 # See LICENSE for license information.
 
-"""MLA YARN RoPE for DSv3 671B — Triton forward and backward kernels.
+"""MLA RoPE for DSv3 671B — Triton forward and backward kernels.
 
 Source: Megatron-LM megatron/core/fusions/fused_mla_yarn_rope_apply.py
 Falls back to pure PyTorch when Triton is unavailable.
+
+Note: DSv3 uses YaRN-scaled RoPE for long-context extrapolation. This test
+intentionally uses plain RoPE (base=10000) because it only validates MXFP8
+attention path wiring, tensor shapes, forward/backward flow, and relative BF16
+vs MXFP8 behavior. Both reference and MXFP8 paths use the same RoPE tables.
 """
 
 import torch
@@ -442,22 +447,33 @@ def apply_mla_rope(
             q, k, v, cos_table, sin_table,
             head_dim_nope, head_dim_rope, head_dim_v,
         )
-    return _apply_pytorch(q, k, v, cos_table, sin_table, head_dim_rope)
+    return _apply_pytorch(q, k, v, cos_table, sin_table, head_dim_nope, head_dim_rope)
 
 
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1, x2 = x.chunk(2, dim=-1)
-    return torch.cat((-x2, x1), dim=-1)
+def _rotate_interleaved_to_neox(
+    x: torch.Tensor, cos_table: torch.Tensor, sin_table: torch.Tensor
+) -> torch.Tensor:
+    cos_ = cos_table[:, None, None, :].to(x.dtype)
+    sin_ = sin_table[:, None, None, :].to(x.dtype)
+    half_dim = x.shape[-1] // 2
+    x_1 = x[..., 0::2]
+    x_2 = x[..., 1::2]
+    x_left = x_1 * cos_[..., :half_dim] - x_2 * sin_[..., :half_dim]
+    x_right = x_2 * cos_[..., half_dim:] + x_1 * sin_[..., half_dim:]
+    return torch.cat((x_left, x_right), dim=-1)
 
 
-def _apply_pytorch(q, k, v, cos_table, sin_table, head_dim_rope):
-    cos_ = cos_table[:, None, None, :].to(q.dtype)
-    sin_ = sin_table[:, None, None, :].to(q.dtype)
+def _apply_pytorch(q, k, v, cos_table, sin_table, head_dim_nope, head_dim_rope):
+    def _apply_q(t: torch.Tensor) -> torch.Tensor:
+        t_nope = t[..., :head_dim_nope]
+        t_rope = t[..., head_dim_nope : head_dim_nope + head_dim_rope]
+        t_rope = _rotate_interleaved_to_neox(t_rope, cos_table, sin_table)
+        return torch.cat((t_nope, t_rope), dim=-1)
 
-    def _apply(t: torch.Tensor) -> torch.Tensor:
-        t_pass = t[..., :head_dim_rope]
-        t_rot  = t[..., head_dim_rope:]
-        t_rot  = t_rot * cos_ + _rotate_half(t_rot) * sin_
-        return torch.cat((t_pass, t_rot), dim=-1)
+    k_nope = k[..., :head_dim_nope]
+    k_pos_emb = k[:, :, :1, head_dim_nope : head_dim_nope + head_dim_rope]
+    k_rope = _rotate_interleaved_to_neox(k_pos_emb, cos_table, sin_table).expand(
+        -1, -1, k.shape[2], -1
+    )
 
-    return _apply(q), _apply(k), v
+    return _apply_q(q), torch.cat((k_nope, k_rope), dim=-1), v
