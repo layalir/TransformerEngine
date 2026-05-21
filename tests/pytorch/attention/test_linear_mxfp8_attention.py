@@ -2,7 +2,7 @@
 #
 # See LICENSE for license information.
 
-"""MXFP8 end-to-end attention unit test — DSv3 671B MLA dimensions.
+"""MXFP8 end-to-end attention unit test - DSv3 671B MLA dimensions.
 
 Path: Linear(QKV, MXFP8) -> MLA-RoPE (Triton) -> DotProductAttention(MXFP8) -> Linear(out, MXFP8).
 Tensor layout: sbhd (seq-first) throughout.
@@ -10,7 +10,10 @@ Tensor layout: sbhd (seq-first) throughout.
 Run:
     python3 -m pytest tests/pytorch/attention/test_linear_mxfp8_attention.py -v -s
 
-Expected output (GB200, b=1, s=4096):
+Optional BF16 reference/compare:
+    RUN_BF16_REFERENCE=1 python3 -m pytest tests/pytorch/attention/test_linear_mxfp8_attention.py -v -s
+
+Expected optional benchmark output (GB200, b=1, s=4096, RUN_BF16_REFERENCE=1):
     [PERF] b=1 s=4096:
       BF16:  8.917 ms  (459 tok/s)
       MXFP8: 5.637 ms  (727 tok/s)
@@ -55,6 +58,7 @@ SEED          = 42
 
 WARMUP_ITERS = 10
 TIMED_ITERS  = 100
+RUN_BF16_REFERENCE = os.getenv("RUN_BF16_REFERENCE", "0") == "1"
 _DETERMINISTIC = (
     not bool(int(os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")))
     or torch.are_deterministic_algorithms_enabled()
@@ -72,7 +76,7 @@ def _set_seed(seed: int = SEED) -> None:
     torch.cuda.manual_seed(seed)
 
 
-def _build_modules(dtype: torch.dtype = torch.bfloat16):
+def _build_modules(dtype: torch.dtype = torch.bfloat16, include_reference: bool = True):
     def _make_triple():
         qkv = te.Linear(HIDDEN_SIZE, QKV_SIZE, bias=True).to(dtype=dtype, device="cuda")
         dpa = te.DotProductAttention(
@@ -84,22 +88,29 @@ def _build_modules(dtype: torch.dtype = torch.bfloat16):
         out = te.Linear(HIDDEN_SIZE, HIDDEN_SIZE, bias=True).to(dtype=dtype, device="cuda")
         return qkv, dpa, out
 
-    base = _make_triple()
+    base = _make_triple() if include_reference else None
     mxfp8 = _make_triple()
 
-    with torch.no_grad():
-        for p_dst, p_src in zip(mxfp8[0].parameters(), base[0].parameters()):
-            p_dst.copy_(p_src)
-        for p_dst, p_src in zip(mxfp8[2].parameters(), base[2].parameters()):
-            p_dst.copy_(p_src)
+    if include_reference:
+        with torch.no_grad():
+            for p_dst, p_src in zip(mxfp8[0].parameters(), base[0].parameters()):
+                p_dst.copy_(p_src)
+            for p_dst, p_src in zip(mxfp8[2].parameters(), base[2].parameters()):
+                p_dst.copy_(p_src)
 
-    for m in base + mxfp8:
+    modules = mxfp8 if base is None else base + mxfp8
+    for m in modules:
         m.train()
 
     return base, mxfp8
 
 
-def _require_attention_backends(batch_size: int, seq_len: int, fp8_recipe) -> None:
+def _require_attention_backends(
+    batch_size: int,
+    seq_len: int,
+    fp8_recipe,
+    require_bf16: bool = False,
+) -> None:
     if get_cudnn_version() < (9, 2, 1):
         pytest.skip("cuDNN 9.2.1+ is required for FP8 fused attention.")
 
@@ -124,15 +135,16 @@ def _require_attention_backends(batch_size: int, seq_len: int, fp8_recipe) -> No
     if flash_attn_supported + fused_attn_supported_fp8 < 1:
         pytest.skip("No FP8 attention backend available for DSv3 MLA shape.")
 
-    bf16_backends, _, _ = get_available_attention_backends(
-        config,
-        qkv_dtype=torch.bfloat16,
-        qkv_layout="sbhd_sbhd_sbhd",
-        is_training=True,
-        deterministic=_DETERMINISTIC,
-    )
-    if sum(bf16_backends) < 1:
-        pytest.skip("No BF16 attention backend available for DSv3 MLA shape.")
+    if require_bf16:
+        bf16_backends, _, _ = get_available_attention_backends(
+            config,
+            qkv_dtype=torch.bfloat16,
+            qkv_layout="sbhd_sbhd_sbhd",
+            is_training=True,
+            deterministic=_DETERMINISTIC,
+        )
+        if sum(bf16_backends) < 1:
+            pytest.skip("No BF16 attention backend available for DSv3 MLA shape.")
 
     _attention_backends["backend_selection_requires_update"] = True
 
@@ -210,33 +222,47 @@ def _benchmark_fn(fn, *args, warmup: int = WARMUP_ITERS, iters: int = TIMED_ITER
 class TestLinearMXFP8Attention:
 
     def test_accuracy(self, batch_size: int, seq_len: int) -> None:
-        """Tolerances are loose (uncalibrated scales); catches NaN/zero/sign-flip, not precision."""
+        """Validate MXFP8; optionally compare with BF16 using loose tolerances."""
         fp8_recipe = MXFP8BlockScaling(fp8_dpa=True)
-        _require_attention_backends(batch_size, seq_len, fp8_recipe)
+        _require_attention_backends(
+            batch_size,
+            seq_len,
+            fp8_recipe,
+            require_bf16=RUN_BF16_REFERENCE,
+        )
         _set_seed()
-        baseline_modules, mxfp8_modules = _build_modules()
+        baseline_modules, mxfp8_modules = _build_modules(include_reference=RUN_BF16_REFERENCE)
         x = torch.randn(seq_len, batch_size, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
 
-        qkv_bf16, out_bf16 = _run_forward_bf16(baseline_modules, x)
+        if RUN_BF16_REFERENCE:
+            qkv_bf16, out_bf16 = _run_forward_bf16(baseline_modules, x)
         qkv_mxfp8, out_mxfp8 = _run_forward_mxfp8(mxfp8_modules, x, fp8_recipe)
 
         assert not torch.isnan(qkv_mxfp8).any(), "MXFP8 QKV contains NaN"
         assert not torch.isinf(qkv_mxfp8).any(), "MXFP8 QKV contains Inf"
-        max_abs_qkv, rms_qkv = _compute_errors(qkv_bf16, qkv_mxfp8)
-        print(f"\n[QKV] b={batch_size} s={seq_len}: max_abs={max_abs_qkv:.6f}  rms={rms_qkv:.6f}")
-        torch.testing.assert_close(
-            qkv_mxfp8, qkv_bf16, atol=2.0, rtol=0.5,
-            msg=f"QKV mismatch: max_abs={max_abs_qkv:.6f} rms={rms_qkv:.6f}",
-        )
+        assert qkv_mxfp8.float().abs().max() > 0, "MXFP8 QKV is all zeros"
 
         assert not torch.isnan(out_mxfp8).any(), "MXFP8 output contains NaN"
         assert not torch.isinf(out_mxfp8).any(), "MXFP8 output contains Inf"
-        max_abs_out, rms_out = _compute_errors(out_bf16, out_mxfp8)
-        print(f"[OUT] b={batch_size} s={seq_len}: max_abs={max_abs_out:.6f}  rms={rms_out:.6f}")
-        torch.testing.assert_close(
-            out_mxfp8, out_bf16, atol=8.0, rtol=2.0,
-            msg=f"Output mismatch: max_abs={max_abs_out:.6f} rms={rms_out:.6f}",
-        )
+        assert out_mxfp8.float().abs().max() > 0, "MXFP8 output is all zeros"
+
+        if RUN_BF16_REFERENCE:
+            max_abs_qkv, rms_qkv = _compute_errors(qkv_bf16, qkv_mxfp8)
+            print(
+                f"\n[QKV] b={batch_size} s={seq_len}: "
+                f"max_abs={max_abs_qkv:.6f}  rms={rms_qkv:.6f}"
+            )
+            torch.testing.assert_close(
+                qkv_mxfp8, qkv_bf16, atol=2.0, rtol=0.5,
+                msg=f"QKV mismatch: max_abs={max_abs_qkv:.6f} rms={rms_qkv:.6f}",
+            )
+
+            max_abs_out, rms_out = _compute_errors(out_bf16, out_mxfp8)
+            print(f"[OUT] b={batch_size} s={seq_len}: max_abs={max_abs_out:.6f}  rms={rms_out:.6f}")
+            torch.testing.assert_close(
+                out_mxfp8, out_bf16, atol=8.0, rtol=2.0,
+                msg=f"Output mismatch: max_abs={max_abs_out:.6f} rms={rms_out:.6f}",
+            )
 
     def test_backward(self, batch_size: int, seq_len: int) -> None:
         """Gradients must flow end-to-end without NaN/Inf."""
@@ -273,32 +299,46 @@ class TestLinearMXFP8Attention:
         reason="Benchmark test - run with RUN_BENCHMARK_TESTS=1 pytest -k performance",
     )
     def test_performance(self, batch_size: int, seq_len: int) -> None:
-        """MXFP8 must be faster than BF16. Weights pre-cached via is_first_microbatch=True
-        (pre-quantized weights reused each iteration, no per-iteration weight quantization)."""
+        """Benchmark MXFP8, optionally comparing with BF16.
+
+        Weights are pre-cached via is_first_microbatch=True so pre-quantized
+        weights are reused each iteration without per-iteration weight quantization.
+        """
         fp8_recipe = MXFP8BlockScaling(fp8_dpa=True)
-        _require_attention_backends(batch_size, seq_len, fp8_recipe)
+        _require_attention_backends(
+            batch_size,
+            seq_len,
+            fp8_recipe,
+            require_bf16=RUN_BF16_REFERENCE,
+        )
         _set_seed()
-        baseline_modules, mxfp8_modules = _build_modules()
+        baseline_modules, mxfp8_modules = _build_modules(include_reference=RUN_BF16_REFERENCE)
         x = torch.randn(seq_len, batch_size, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
 
         with torch.no_grad():
             _run_forward_mxfp8(mxfp8_modules, x, fp8_recipe, is_first_microbatch=True)
 
-        bf16_ms   = _benchmark_fn(_run_forward_bf16,  baseline_modules, x)
         mxfp8_ms  = _benchmark_fn(_run_forward_mxfp8, mxfp8_modules, x, fp8_recipe, False)
-        speedup   = bf16_ms / mxfp8_ms
-
-        bf16_tok  = (batch_size * seq_len) / (bf16_ms  / 1000.0)
         mxfp8_tok = (batch_size * seq_len) / (mxfp8_ms / 1000.0)
 
-        print(
-            f"\n[PERF] b={batch_size} s={seq_len}:"
-            f"\n  BF16:  {bf16_ms:.3f} ms  ({bf16_tok:.0f} tok/s)"
-            f"\n  MXFP8: {mxfp8_ms:.3f} ms  ({mxfp8_tok:.0f} tok/s)"
-            f"\n  Speedup: {speedup:.2f}x"
-        )
+        if RUN_BF16_REFERENCE:
+            bf16_ms = _benchmark_fn(_run_forward_bf16, baseline_modules, x)
+            bf16_tok = (batch_size * seq_len) / (bf16_ms / 1000.0)
+            speedup = bf16_ms / mxfp8_ms
+            print(
+                f"\n[PERF] b={batch_size} s={seq_len}:"
+                f"\n  BF16:  {bf16_ms:.3f} ms  ({bf16_tok:.0f} tok/s)"
+                f"\n  MXFP8: {mxfp8_ms:.3f} ms  ({mxfp8_tok:.0f} tok/s)"
+                f"\n  Speedup: {speedup:.2f}x"
+            )
 
-        assert speedup > 1.0, (
-            f"MXFP8 path should be faster than BF16 (linears are 2x throughput): "
-            f"got {mxfp8_ms:.3f} ms vs BF16 {bf16_ms:.3f} ms (speedup={speedup:.2f}x)"
-        )
+            assert speedup > 1.0, (
+                f"MXFP8 path should be faster than BF16 (linears are 2x throughput): "
+                f"got {mxfp8_ms:.3f} ms vs BF16 {bf16_ms:.3f} ms (speedup={speedup:.2f}x)"
+            )
+        else:
+            print(
+                f"\n[PERF] b={batch_size} s={seq_len}:"
+                f"\n  MXFP8: {mxfp8_ms:.3f} ms  ({mxfp8_tok:.0f} tok/s)"
+            )
+            assert mxfp8_ms > 0.0

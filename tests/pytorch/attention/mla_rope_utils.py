@@ -2,7 +2,7 @@
 #
 # See LICENSE for license information.
 
-"""MLA RoPE for DSv3 671B — Triton forward and backward kernels.
+"""MLA RoPE for DSv3 671B - Triton forward and backward kernels.
 
 Source: Megatron-LM megatron/core/fusions/fused_mla_yarn_rope_apply.py
 Falls back to pure PyTorch when Triton is unavailable.
@@ -416,8 +416,8 @@ if HAVE_TRITON:
                 d_emb.stride(0),
                 0, 1,
             )
-            # d_kv[:,: ,:ndp] → k_nope grad (all heads)
-            # d_emb[:,0,:]   → k_rope grad for head 0 only (k_pos_emb = k[:,:,0,ndp:])
+            # d_kv[:,: ,:ndp] -> k_nope grad (all heads)
+            # d_emb[:,0,:]   -> k_rope grad for head 0 only (k_pos_emb = k[:,:,0,ndp:])
             d_kv_4d  = d_kv.view(s, b, nheads, ndp + ndv)
             d_emb_4d = d_emb.view(s, b, 1, ndr)
             dk_in    = torch.zeros(s, b, nheads, ndp + ndr, dtype=dq.dtype, device=dq.device)
