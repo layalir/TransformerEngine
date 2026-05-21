@@ -13,10 +13,14 @@ Run:
 Optional BF16 reference/compare:
     RUN_BF16_REFERENCE=1 python3 -m pytest tests/pytorch/attention/test_linear_mxfp8_attention.py -v -s
 
-Expected optional benchmark output (GB200, b=1, s=4096, RUN_BF16_REFERENCE=1):
-    [PERF] b=1 s=4096:
-      BF16:  8.917 ms  (459 tok/s)
-      MXFP8: 5.637 ms  (727 tok/s)
+Expected optional benchmark output (GB200, b=1, s=4096, RUN_BENCHMARK_TESTS=1):
+    [PERF] b=1 s=4096 fprop+bprop:
+      MXFP8: 13.456 ms  (304 tok/s)
+
+Expected optional BF16 comparison output (also set RUN_BF16_REFERENCE=1):
+    [PERF] b=1 s=4096 fprop+bprop:
+      BF16:  18.912 ms  (217 tok/s)
+      MXFP8: 13.456 ms  (304 tok/s)
       Speedup: 1.58x
 """
 
@@ -201,6 +205,32 @@ def _compute_errors(a: torch.Tensor, b: torch.Tensor) -> tuple[float, float]:
     return diff.max().item(), diff.pow(2).mean().sqrt().item()
 
 
+def _clear_training_step_grads(modules: tuple, x: torch.Tensor) -> None:
+    x.grad = None
+    for module in modules:
+        for param in module.parameters():
+            param.grad = None
+
+
+def _run_training_step_bf16(modules: tuple, x: torch.Tensor) -> torch.Tensor:
+    _clear_training_step_grads(modules, x)
+    _, out = _run_forward_bf16(modules, x)
+    out.sum().backward()
+    return out
+
+
+def _run_training_step_mxfp8(
+    modules: tuple,
+    x: torch.Tensor,
+    recipe,
+    is_first_microbatch: bool | None = None,
+) -> torch.Tensor:
+    _clear_training_step_grads(modules, x)
+    _, out = _run_forward_mxfp8(modules, x, recipe, is_first_microbatch)
+    out.sum().backward()
+    return out
+
+
 def _benchmark_fn(fn, *args, warmup: int = WARMUP_ITERS, iters: int = TIMED_ITERS) -> float:
     for _ in range(warmup):
         fn(*args)
@@ -269,7 +299,7 @@ class TestLinearMXFP8Attention:
         fp8_recipe = MXFP8BlockScaling(fp8_dpa=True)
         _require_attention_backends(batch_size, seq_len, fp8_recipe)
         _set_seed()
-        _, mxfp8_modules = _build_modules()
+        _, mxfp8_modules = _build_modules(include_reference=False)
 
         x = torch.randn(
             seq_len, batch_size, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda",
@@ -313,20 +343,25 @@ class TestLinearMXFP8Attention:
         )
         _set_seed()
         baseline_modules, mxfp8_modules = _build_modules(include_reference=RUN_BF16_REFERENCE)
-        x = torch.randn(seq_len, batch_size, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        x = torch.randn(
+            seq_len, batch_size, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda",
+            requires_grad=True,
+        )
 
         with torch.no_grad():
             _run_forward_mxfp8(mxfp8_modules, x, fp8_recipe, is_first_microbatch=True)
 
-        mxfp8_ms  = _benchmark_fn(_run_forward_mxfp8, mxfp8_modules, x, fp8_recipe, False)
+        mxfp8_ms = _benchmark_fn(
+            _run_training_step_mxfp8, mxfp8_modules, x, fp8_recipe, False
+        )
         mxfp8_tok = (batch_size * seq_len) / (mxfp8_ms / 1000.0)
 
         if RUN_BF16_REFERENCE:
-            bf16_ms = _benchmark_fn(_run_forward_bf16, baseline_modules, x)
+            bf16_ms = _benchmark_fn(_run_training_step_bf16, baseline_modules, x)
             bf16_tok = (batch_size * seq_len) / (bf16_ms / 1000.0)
             speedup = bf16_ms / mxfp8_ms
             print(
-                f"\n[PERF] b={batch_size} s={seq_len}:"
+                f"\n[PERF] b={batch_size} s={seq_len} fprop+bprop:"
                 f"\n  BF16:  {bf16_ms:.3f} ms  ({bf16_tok:.0f} tok/s)"
                 f"\n  MXFP8: {mxfp8_ms:.3f} ms  ({mxfp8_tok:.0f} tok/s)"
                 f"\n  Speedup: {speedup:.2f}x"
@@ -338,7 +373,7 @@ class TestLinearMXFP8Attention:
             )
         else:
             print(
-                f"\n[PERF] b={batch_size} s={seq_len}:"
+                f"\n[PERF] b={batch_size} s={seq_len} fprop+bprop:"
                 f"\n  MXFP8: {mxfp8_ms:.3f} ms  ({mxfp8_tok:.0f} tok/s)"
             )
             assert mxfp8_ms > 0.0
