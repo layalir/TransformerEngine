@@ -13,7 +13,7 @@ Run:
 Optional BF16 reference/compare:
     RUN_BF16_REFERENCE=1 python3 -m pytest tests/pytorch/attention/test_linear_mxfp8_attention.py -v -s
 
-Expected optional benchmark output (GB200, b=1, s=4096, RUN_BENCHMARK_TESTS=1):
+Expected benchmark output (GB200, b=1, s=4096):
     [PERF] b=1 s=4096:
       MXFP8 fprop:  5.210 ms  (786180 tok/s)
       MXFP8 bprop:  8.763 ms  (467428 tok/s)
@@ -343,10 +343,6 @@ class TestLinearMXFP8Attention:
         print(f"\n[BPROP] b={batch_size} s={seq_len}: dx rms={dx_rms:.6f}")
         assert dx_rms > 0.0, "MXFP8 path: input grad is all zeros (no gradient flow)"
 
-    @pytest.mark.skipif(
-        os.getenv("RUN_BENCHMARK_TESTS", "0") != "1",
-        reason="Benchmark test - run with RUN_BENCHMARK_TESTS=1 pytest -k performance",
-    )
     def test_performance(self, batch_size: int, seq_len: int) -> None:
         """Benchmark MXFP8, optionally comparing with BF16.
 
