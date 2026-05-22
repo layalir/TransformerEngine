@@ -14,14 +14,18 @@ Optional BF16 reference/compare:
     RUN_BF16_REFERENCE=1 python3 -m pytest tests/pytorch/attention/test_linear_mxfp8_attention.py -v -s
 
 Expected optional benchmark output (GB200, b=1, s=4096, RUN_BENCHMARK_TESTS=1):
-    [PERF] b=1 s=4096 fprop+bprop:
-      MXFP8: 13.456 ms  (304 tok/s)
+    [PERF] b=1 s=4096:
+      MXFP8 fprop:  5.210 ms  (786180 tok/s)
+      MXFP8 bprop:  8.763 ms  (467428 tok/s)
 
 Expected optional BF16 comparison output (also set RUN_BF16_REFERENCE=1):
-    [PERF] b=1 s=4096 fprop+bprop:
-      BF16:  18.912 ms  (217 tok/s)
-      MXFP8: 13.456 ms  (304 tok/s)
-      Speedup: 1.58x
+    [PERF] b=1 s=4096:
+      BF16 fprop:   8.582 ms  (477274 tok/s)
+      BF16 bprop:  14.006 ms  (292445 tok/s)
+      MXFP8 fprop:  5.210 ms  (786180 tok/s)
+      MXFP8 bprop:  8.763 ms  (467428 tok/s)
+      Fprop speedup: 1.65x
+      Bprop speedup: 1.60x
 """
 
 import os
@@ -212,37 +216,43 @@ def _clear_training_step_grads(modules: tuple, x: torch.Tensor) -> None:
             param.grad = None
 
 
-def _run_training_step_bf16(modules: tuple, x: torch.Tensor) -> torch.Tensor:
-    _clear_training_step_grads(modules, x)
-    _, out = _run_forward_bf16(modules, x)
-    out.sum().backward()
-    return out
-
-
-def _run_training_step_mxfp8(
+def _benchmark_training_step(
+    forward_fn,
     modules: tuple,
     x: torch.Tensor,
-    recipe,
-    is_first_microbatch: bool | None = None,
-) -> torch.Tensor:
-    _clear_training_step_grads(modules, x)
-    _, out = _run_forward_mxfp8(modules, x, recipe, is_first_microbatch)
-    out.sum().backward()
-    return out
-
-
-def _benchmark_fn(fn, *args, warmup: int = WARMUP_ITERS, iters: int = TIMED_ITERS) -> float:
+    *forward_args,
+    warmup: int = WARMUP_ITERS,
+    iters: int = TIMED_ITERS,
+) -> tuple[float, float]:
     for _ in range(warmup):
-        fn(*args)
+        _clear_training_step_grads(modules, x)
+        _, out = forward_fn(modules, x, *forward_args)
+        out.sum().backward()
     torch.cuda.synchronize()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
+
+    fprop_ms = 0.0
+    bprop_ms = 0.0
     for _ in range(iters):
-        fn(*args)
-    end.record()
-    torch.cuda.synchronize()
-    return start.elapsed_time(end) / iters
+        _clear_training_step_grads(modules, x)
+
+        fprop_start = torch.cuda.Event(enable_timing=True)
+        fprop_end = torch.cuda.Event(enable_timing=True)
+        bprop_start = torch.cuda.Event(enable_timing=True)
+        bprop_end = torch.cuda.Event(enable_timing=True)
+
+        fprop_start.record()
+        _, out = forward_fn(modules, x, *forward_args)
+        fprop_end.record()
+
+        bprop_start.record()
+        out.sum().backward()
+        bprop_end.record()
+
+        torch.cuda.synchronize()
+        fprop_ms += fprop_start.elapsed_time(fprop_end)
+        bprop_ms += bprop_start.elapsed_time(bprop_end)
+
+    return fprop_ms / iters, bprop_ms / iters
 
 
 @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
@@ -351,29 +361,45 @@ class TestLinearMXFP8Attention:
         with torch.no_grad():
             _run_forward_mxfp8(mxfp8_modules, x, fp8_recipe, is_first_microbatch=True)
 
-        mxfp8_ms = _benchmark_fn(
-            _run_training_step_mxfp8, mxfp8_modules, x, fp8_recipe, False
+        mxfp8_fprop_ms, mxfp8_bprop_ms = _benchmark_training_step(
+            _run_forward_mxfp8, mxfp8_modules, x, fp8_recipe, False
         )
-        mxfp8_tok = (batch_size * seq_len) / (mxfp8_ms / 1000.0)
+        mxfp8_fprop_tok = (batch_size * seq_len) / (mxfp8_fprop_ms / 1000.0)
+        mxfp8_bprop_tok = (batch_size * seq_len) / (mxfp8_bprop_ms / 1000.0)
 
         if RUN_BF16_REFERENCE:
-            bf16_ms = _benchmark_fn(_run_training_step_bf16, baseline_modules, x)
-            bf16_tok = (batch_size * seq_len) / (bf16_ms / 1000.0)
-            speedup = bf16_ms / mxfp8_ms
+            bf16_fprop_ms, bf16_bprop_ms = _benchmark_training_step(
+                _run_forward_bf16, baseline_modules, x
+            )
+            bf16_fprop_tok = (batch_size * seq_len) / (bf16_fprop_ms / 1000.0)
+            bf16_bprop_tok = (batch_size * seq_len) / (bf16_bprop_ms / 1000.0)
+            fprop_speedup = bf16_fprop_ms / mxfp8_fprop_ms
+            bprop_speedup = bf16_bprop_ms / mxfp8_bprop_ms
             print(
-                f"\n[PERF] b={batch_size} s={seq_len} fprop+bprop:"
-                f"\n  BF16:  {bf16_ms:.3f} ms  ({bf16_tok:.0f} tok/s)"
-                f"\n  MXFP8: {mxfp8_ms:.3f} ms  ({mxfp8_tok:.0f} tok/s)"
-                f"\n  Speedup: {speedup:.2f}x"
+                f"\n[PERF] b={batch_size} s={seq_len}:"
+                f"\n  BF16 fprop:  {bf16_fprop_ms:.3f} ms  ({bf16_fprop_tok:.0f} tok/s)"
+                f"\n  BF16 bprop:  {bf16_bprop_ms:.3f} ms  ({bf16_bprop_tok:.0f} tok/s)"
+                f"\n  MXFP8 fprop: {mxfp8_fprop_ms:.3f} ms  ({mxfp8_fprop_tok:.0f} tok/s)"
+                f"\n  MXFP8 bprop: {mxfp8_bprop_ms:.3f} ms  ({mxfp8_bprop_tok:.0f} tok/s)"
+                f"\n  Fprop speedup: {fprop_speedup:.2f}x"
+                f"\n  Bprop speedup: {bprop_speedup:.2f}x"
             )
 
-            assert speedup > 1.0, (
-                f"MXFP8 path should be faster than BF16 (linears are 2x throughput): "
-                f"got {mxfp8_ms:.3f} ms vs BF16 {bf16_ms:.3f} ms (speedup={speedup:.2f}x)"
+            assert fprop_speedup > 1.0, (
+                f"MXFP8 fprop should be faster than BF16: "
+                f"got {mxfp8_fprop_ms:.3f} ms vs BF16 {bf16_fprop_ms:.3f} ms "
+                f"(speedup={fprop_speedup:.2f}x)"
+            )
+            assert bprop_speedup > 1.0, (
+                f"MXFP8 bprop should be faster than BF16: "
+                f"got {mxfp8_bprop_ms:.3f} ms vs BF16 {bf16_bprop_ms:.3f} ms "
+                f"(speedup={bprop_speedup:.2f}x)"
             )
         else:
             print(
-                f"\n[PERF] b={batch_size} s={seq_len} fprop+bprop:"
-                f"\n  MXFP8: {mxfp8_ms:.3f} ms  ({mxfp8_tok:.0f} tok/s)"
+                f"\n[PERF] b={batch_size} s={seq_len}:"
+                f"\n  MXFP8 fprop: {mxfp8_fprop_ms:.3f} ms  ({mxfp8_fprop_tok:.0f} tok/s)"
+                f"\n  MXFP8 bprop: {mxfp8_bprop_ms:.3f} ms  ({mxfp8_bprop_tok:.0f} tok/s)"
             )
-            assert mxfp8_ms > 0.0
+            assert mxfp8_fprop_ms > 0.0
+            assert mxfp8_bprop_ms > 0.0
