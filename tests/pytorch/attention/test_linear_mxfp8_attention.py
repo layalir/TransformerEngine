@@ -55,17 +55,17 @@ except (ImportError, AttributeError):
     reason_for_no_mxfp8 = "MXFP8BlockScaling not available in this build"
 
 # DSv3 671B MLA dims (micro_batch=1, seq_len=4096)
-NUM_HEADS     = 128
+NUM_HEADS = 128
 HEAD_DIM_ROPE = 64
 HEAD_DIM_NOPE = 128
-HEAD_DIM_QK   = HEAD_DIM_NOPE + HEAD_DIM_ROPE   # 192
-HEAD_DIM_V    = 128
-HIDDEN_SIZE   = NUM_HEADS * HEAD_DIM_V           # 16384
-QKV_SIZE      = NUM_HEADS * (2 * HEAD_DIM_QK + HEAD_DIM_V)  # 65536
-SEED          = 42
+HEAD_DIM_QK = HEAD_DIM_NOPE + HEAD_DIM_ROPE  # 192
+HEAD_DIM_V = 128
+HIDDEN_SIZE = NUM_HEADS * HEAD_DIM_V  # 16384
+QKV_SIZE = NUM_HEADS * (2 * HEAD_DIM_QK + HEAD_DIM_V)  # 65536
+SEED = 42
 
 WARMUP_ITERS = 10
-TIMED_ITERS  = 100
+TIMED_ITERS = 100
 RUN_BF16_REFERENCE = os.getenv("RUN_BF16_REFERENCE", "0") == "1"
 _DETERMINISTIC = (
     not bool(int(os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")))
@@ -289,18 +289,23 @@ class TestLinearMXFP8Attention:
         if RUN_BF16_REFERENCE:
             max_abs_qkv, rms_qkv = _compute_errors(qkv_bf16, qkv_mxfp8)
             print(
-                f"\n[QKV] b={batch_size} s={seq_len}: "
-                f"max_abs={max_abs_qkv:.6f}  rms={rms_qkv:.6f}"
+                f"\n[QKV] b={batch_size} s={seq_len}: max_abs={max_abs_qkv:.6f}  rms={rms_qkv:.6f}"
             )
             torch.testing.assert_close(
-                qkv_mxfp8, qkv_bf16, atol=2.0, rtol=0.5,
+                qkv_mxfp8,
+                qkv_bf16,
+                atol=2.0,
+                rtol=0.5,
                 msg=f"QKV mismatch: max_abs={max_abs_qkv:.6f} rms={rms_qkv:.6f}",
             )
 
             max_abs_out, rms_out = _compute_errors(out_bf16, out_mxfp8)
             print(f"[OUT] b={batch_size} s={seq_len}: max_abs={max_abs_out:.6f}  rms={rms_out:.6f}")
             torch.testing.assert_close(
-                out_mxfp8, out_bf16, atol=8.0, rtol=2.0,
+                out_mxfp8,
+                out_bf16,
+                atol=8.0,
+                rtol=2.0,
                 msg=f"Output mismatch: max_abs={max_abs_out:.6f} rms={rms_out:.6f}",
             )
 
@@ -312,7 +317,11 @@ class TestLinearMXFP8Attention:
         _, mxfp8_modules = _build_modules(include_reference=False)
 
         x = torch.randn(
-            seq_len, batch_size, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda",
+            seq_len,
+            batch_size,
+            HIDDEN_SIZE,
+            dtype=torch.bfloat16,
+            device="cuda",
             requires_grad=True,
         )
 
@@ -354,7 +363,11 @@ class TestLinearMXFP8Attention:
         _set_seed()
         baseline_modules, mxfp8_modules = _build_modules(include_reference=RUN_BF16_REFERENCE)
         x = torch.randn(
-            seq_len, batch_size, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda",
+            seq_len,
+            batch_size,
+            HIDDEN_SIZE,
+            dtype=torch.bfloat16,
+            device="cuda",
             requires_grad=True,
         )
 
@@ -386,12 +399,12 @@ class TestLinearMXFP8Attention:
             )
 
             assert fprop_speedup > 1.0, (
-                f"MXFP8 fprop should be faster than BF16: "
+                "MXFP8 fprop should be faster than BF16: "
                 f"got {mxfp8_fprop_ms:.3f} ms vs BF16 {bf16_fprop_ms:.3f} ms "
                 f"(speedup={fprop_speedup:.2f}x)"
             )
             assert bprop_speedup > 1.0, (
-                f"MXFP8 bprop should be faster than BF16: "
+                "MXFP8 bprop should be faster than BF16: "
                 f"got {mxfp8_bprop_ms:.3f} ms vs BF16 {bf16_bprop_ms:.3f} ms "
                 f"(speedup={bprop_speedup:.2f}x)"
             )
