@@ -268,10 +268,7 @@ class TestLinearMXFP8Attention:
         assert out_mxfp8.float().abs().max() > 0, "MXFP8 output is all zeros"
 
         max_abs_qkv, rms_qkv = _compute_errors(qkv_bf16, qkv_mxfp8)
-        print(
-            f"\n[QKV] b={batch_size} s={seq_len}: "
-            f"max_abs={max_abs_qkv:.6f}  rms={rms_qkv:.6f}"
-        )
+        print(f"\n[QKV] b={batch_size} s={seq_len}: max_abs={max_abs_qkv:.6f}  rms={rms_qkv:.6f}")
         torch.testing.assert_close(
             qkv_mxfp8,
             qkv_bf16,
