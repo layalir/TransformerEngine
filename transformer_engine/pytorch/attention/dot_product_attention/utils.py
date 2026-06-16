@@ -2665,6 +2665,174 @@ def mxfp8_quantize_fast_path(tensor_quantizer_pairs, src_format):
     return result, "bhsd"
 
 
+def _mxfp8_scale_as_uint8(scale, name):
+    """Return a raw uint8 view of an MXFP8 E8M0 scale tensor."""
+    if scale.dtype == torch.uint8:
+        return scale
+    try:
+        return scale.view(torch.uint8)
+    except RuntimeError as exc:
+        raise TypeError(
+            f"{name} must be raw uint8 E8M0 scale data; got dtype={scale.dtype}."
+        ) from exc
+
+
+def _mla_rope_table_to_2d(table, seq_len, name):
+    """Normalize Megatron RoPE tables to the cuDNN wrapper's [S, D] contract."""
+    if table.ndim == 4:
+        if table.shape[1] != 1 or table.shape[2] != 1:
+            raise ValueError(
+                f"{name} with rank 4 must have shape [S, 1, 1, D], got {tuple(table.shape)}."
+            )
+        table = table.reshape(table.shape[0], table.shape[3])
+    elif table.ndim != 2:
+        raise ValueError(f"{name} must have shape [S, D] or [S, 1, 1, D], got {tuple(table.shape)}.")
+
+    if table.shape[0] < seq_len:
+        raise ValueError(f"{name} length {table.shape[0]} is shorter than seq_len {seq_len}.")
+    table = table[:seq_len]
+    if table.shape[1] != 64:
+        raise ValueError(f"{name} last dimension must be 64 for DSv3 MLA RoPE, got {table.shape[1]}.")
+    if table.dtype != torch.bfloat16:
+        raise TypeError(f"{name} must be torch.bfloat16 for the fused cuDNN path, got {table.dtype}.")
+    return table.contiguous() if not table.is_contiguous() else table
+
+
+def fused_mla_rope_mxfp8_quantize_sbhd(
+    q,
+    kv,
+    k_pos_emb,
+    cos,
+    sin,
+    qkv_quantizer=None,
+    *,
+    swizzle_scales=True,
+):
+    """Fuse DSv3 MLA RoPE with fprop MXFP8 Q/K/V quantization for SBHD tensors.
+
+    This helper is intentionally narrow: it supports the DSv3 MLA fprop shape
+    contract only, emits Q/K/V data in SBHD, emits compact scale inverses in
+    BHSD, and optionally invokes TE's existing GEMM scale swizzle kernels.
+    """
+    if qkv_quantizer is None:
+        qkv_quantizer = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=True)
+    elif not isinstance(qkv_quantizer, MXFP8Quantizer):
+        raise TypeError(
+            "fused_mla_rope_mxfp8_quantize_sbhd requires an MXFP8Quantizer for QKV."
+        )
+    if q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16 or k_pos_emb.dtype != torch.bfloat16:
+        raise TypeError(
+            "fused_mla_rope_mxfp8_quantize_sbhd currently expects BF16 q, kv, and k_pos_emb."
+        )
+    if q.ndim != 4 or kv.ndim != 4 or k_pos_emb.ndim != 4:
+        raise ValueError("q, kv, and k_pos_emb must be rank-4 SBHD tensors.")
+    if q.device.type != "cuda" or kv.device != q.device or k_pos_emb.device != q.device:
+        raise ValueError("q, kv, and k_pos_emb must be CUDA tensors on the same device.")
+
+    seq_len, batch, num_heads, qk_dim = q.shape
+    if qk_dim != 192:
+        raise ValueError(f"DSv3 MLA fused path expects q last dimension 192, got {qk_dim}.")
+    if kv.shape != (seq_len, batch, num_heads, 256):
+        raise ValueError(
+            "DSv3 MLA fused path expects kv shape "
+            f"{(seq_len, batch, num_heads, 256)}, got {tuple(kv.shape)}."
+        )
+    if k_pos_emb.shape != (seq_len, batch, 1, 64):
+        raise ValueError(
+            "DSv3 MLA fused path expects k_pos_emb shape "
+            f"{(seq_len, batch, 1, 64)}, got {tuple(k_pos_emb.shape)}."
+        )
+    if seq_len % MXFP8_BLOCK_SCALING_SIZE != 0:
+        raise ValueError(
+            f"seq_len must be divisible by {MXFP8_BLOCK_SCALING_SIZE} for V columnwise MXFP8, "
+            f"got {seq_len}."
+        )
+
+    cos = _mla_rope_table_to_2d(cos, seq_len, "cos")
+    sin = _mla_rope_table_to_2d(sin, seq_len, "sin")
+
+    try:
+        from cudnn import mla_rope_mxfp8_fprop_wrapper_sm100
+    except ImportError as exc:
+        raise RuntimeError(
+            "cuDNN frontend with mla_rope_mxfp8_fprop_wrapper_sm100 must be importable "
+            "to use fused_mla_rope_mxfp8_quantize_sbhd."
+        ) from exc
+
+    fused = mla_rope_mxfp8_fprop_wrapper_sm100(
+        q,
+        kv,
+        k_pos_emb,
+        cos,
+        sin,
+        return_uint8_scales=True,
+    )
+
+    q_data = fused["q_data"]
+    k_data = fused["k_data"]
+    v_data = fused["v_data"]
+    q_scale = _mxfp8_scale_as_uint8(fused["q_scale"], "q_scale")
+    k_scale = _mxfp8_scale_as_uint8(fused["k_scale"], "k_scale")
+    v_scale = _mxfp8_scale_as_uint8(fused["v_scale"], "v_scale")
+
+    q_quantizer, k_quantizer, v_quantizer = [qkv_quantizer.copy() for _ in range(3)]
+    q_quantizer.rowwise_usage = True
+    q_quantizer.columnwise_usage = False
+    k_quantizer.rowwise_usage = True
+    k_quantizer.columnwise_usage = False
+    v_quantizer.rowwise_usage = False
+    v_quantizer.columnwise_usage = True
+
+    q_fp8 = MXFP8Tensor(
+        shape=q_data.shape,
+        dtype=q.dtype,
+        rowwise_data=q_data,
+        rowwise_scale_inv=q_scale.view(-1, q_scale.shape[-1]),
+        columnwise_data=None,
+        columnwise_scale_inv=None,
+        quantizer=q_quantizer,
+        requires_grad=False,
+        fp8_dtype=tex.DType.kFloat8E4M3,
+        with_gemm_swizzled_scales=False,
+        device=q.device,
+    )
+    k_fp8 = MXFP8Tensor(
+        shape=k_data.shape,
+        dtype=kv.dtype,
+        rowwise_data=k_data,
+        rowwise_scale_inv=k_scale.view(-1, k_scale.shape[-1]),
+        columnwise_data=None,
+        columnwise_scale_inv=None,
+        quantizer=k_quantizer,
+        requires_grad=False,
+        fp8_dtype=tex.DType.kFloat8E4M3,
+        with_gemm_swizzled_scales=False,
+        device=kv.device,
+    )
+    v_fp8 = MXFP8Tensor(
+        shape=v_data.shape,
+        dtype=kv.dtype,
+        rowwise_data=None,
+        rowwise_scale_inv=None,
+        columnwise_data=v_data,
+        columnwise_scale_inv=v_scale.view(-1, v_scale.shape[-1]),
+        quantizer=v_quantizer,
+        requires_grad=False,
+        fp8_dtype=tex.DType.kFloat8E4M3,
+        with_gemm_swizzled_scales=False,
+        device=kv.device,
+    )
+
+    if swizzle_scales:
+        result = [q_fp8, k_fp8, v_fp8]
+        tex.multi_tensor_swizzle_scales_for_gemm_unchecked_(result, True, False)
+        tex.multi_tensor_swizzle_scales_for_gemm_unchecked_(result, False, True)
+        for tensor in result:
+            tensor._with_gemm_swizzled_scales = True
+
+    return q_fp8, k_fp8, v_fp8, "bhsd"
+
+
 def combine_and_quantize(
     qkv_layout,
     q,

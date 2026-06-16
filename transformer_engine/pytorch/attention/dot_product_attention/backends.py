@@ -1386,6 +1386,11 @@ class FusedAttnFunc(torch.autograd.Function):
             #                      fp8_dtype = tex.DType.kFloat8E4M3
             if is_input_fp8:
                 q_fp8, k_fp8, v_fp8 = q, k, v
+                if qkv_type == "mxfp8" and all(
+                    getattr(tensor, "_with_gemm_swizzled_scales", False)
+                    for tensor in (q_fp8, k_fp8, v_fp8)
+                ):
+                    qkv_scale_inv_format = "bhsd"
             else:
                 q_fp8, k_fp8, v_fp8, qkv_layout, qkv_scale_inv_format = combine_and_quantize(
                     qkv_layout, q, k, v, QKV_quantizer, used_in_backward=is_training
